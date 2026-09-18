@@ -32,6 +32,7 @@ CHARTS = {
     "SOXX": ["1m", "5m", "30m", "1h", "1d"],
     "NVDA": ["5m"],
     "QQQ": ["5m"],
+    "SMH": ["5m"],
 }
 VISIBLE_BARS = {"1m": 390, "5m": 240, "30m": 160, "1h": 120, "1d": 120}
 NY_TZ = ZoneInfo("America/New_York")
@@ -40,11 +41,14 @@ PREMARKET_END = "09:30"
 FEDWATCH_FALLBACK_URL = "https://amazingmazy.github.io/fedwatch-monitor/_static/amazingmazy--fedwatch_monitor/fedwatch_latest_forecast.html"
 MARKET = {
     "NQ 선물": "NQ=F",
+    "ES 선물": "ES=F",
     "VIX": "^VIX",
+    "WTI": "CL=F",
     "미국채 10년 금리": "^TNX",
     "DXY": "DX-Y.NYB",
 }
-SEMIS = {"NVDA": "NVDA", "AMD": "AMD", "AVGO": "AVGO", "MU": "MU", "TSM": "TSM"}
+SEMIS = {"NVDA": "NVDA", "AMD": "AMD", "AVGO": "AVGO", "MU": "MU", "TSM": "TSM", "SMH": "SMH"}
+SOXX_HOLDINGS_URL = "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf/1467271812596.ajax?fileType=csv&fileName=SOXX_holdings&dataType=fund"
 
 
 @dataclass
@@ -53,6 +57,10 @@ class Quote:
     price: float | None
     change_pct: float | None
     as_of: str | None
+    bid: float | None = None
+    ask: float | None = None
+    spread: float | None = None
+    quality: str = "MISSING"
 
 
 def clean_number(value: Any) -> float | None:
@@ -64,7 +72,7 @@ def clean_number(value: Any) -> float | None:
 
 
 def download(symbol: str, interval: str) -> pd.DataFrame:
-    period = "7d" if interval == "1m" else "60d" if interval in {"5m", "15m", "30m", "1h"} else "2y"
+    period = "7d" if interval == "1m" else "60d" if interval in {"5m", "15m", "30m", "1h"} else "3y"
     data = yf.download(symbol, period=period, interval=interval, auto_adjust=False, prepost=True, progress=False)
     if data.empty:
         return data
@@ -73,7 +81,31 @@ def download(symbol: str, interval: str) -> pd.DataFrame:
     data = data.dropna(subset=["Open", "High", "Low", "Close"])
     if data.index.tz is None:
         data.index = data.index.tz_localize(timezone.utc)
-    return data
+    return clean_ohlcv(data)
+
+
+def clean_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
+    data = data.sort_index().copy()
+    numeric = ["Open", "High", "Low", "Close", "Volume"]
+    for column in numeric:
+        if column in data:
+            data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.dropna(subset=["Open", "High", "Low", "Close"])
+    valid = (data["High"] >= data[["Open", "Close"]].max(axis=1)) & (data["Low"] <= data[["Open", "Close"]].min(axis=1))
+    returns = data["Close"].pct_change().abs()
+    median_return = returns.rolling(50, min_periods=10).median()
+    outlier = returns > (median_return * 12).clip(lower=0.08)
+    data.loc[~valid | outlier, ["Open", "High", "Low", "Close", "Volume"]] = pd.NA
+    return data.dropna(subset=["Open", "High", "Low", "Close"])
+
+
+def data_quality(data: pd.DataFrame, required_bars: int) -> dict[str, Any]:
+    if data.empty:
+        return {"status": "MISSING", "source": "Yahoo Finance/yfinance", "as_of": None, "bars": 0}
+    as_of = data.index[-1].isoformat()
+    age_minutes = (datetime.now(timezone.utc) - data.index[-1].to_pydatetime().astimezone(timezone.utc)).total_seconds() / 60
+    status = "OK" if len(data) >= required_bars and age_minutes <= 30 else "STALE" if age_minutes > 30 else "LOW QUALITY"
+    return {"status": status, "source": "Yahoo Finance/yfinance", "as_of": as_of, "bars": len(data), "required_bars": required_bars, "age_minutes": round(age_minutes, 1)}
 
 
 def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
@@ -87,9 +119,24 @@ def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
     data["RSI14"] = 100 - (100 / (1 + gain / loss.replace(0, pd.NA)))
     typical = (data["High"] + data["Low"] + close) / 3
     index = data.index.tz_convert(NY_TZ) if getattr(data.index, "tz", None) else data.index.tz_localize(NY_TZ)
-    session = pd.Series(index.date, index=data.index)
-    data["VWAP"] = (typical * data["Volume"]).groupby(session).cumsum() / data["Volume"].groupby(session).cumsum()
+    session = pd.Series(index.map(session_name), index=data.index)
+    volume = pd.to_numeric(data["Volume"], errors="coerce").fillna(0)
+    cumulative_volume = volume.groupby(session).cumsum().replace(0, pd.NA)
+    data["VWAP"] = (typical * volume).groupby(session).cumsum() / cumulative_volume
+    for name in ("PREMARKET", "RTH", "OVERNIGHT"):
+        mask = session == name
+        grouped_volume = volume.where(mask, 0).groupby(pd.Series(index.date, index=data.index)).cumsum().replace(0, pd.NA)
+        data[f"VWAP_{name}"] = ((typical * volume).where(mask, 0).groupby(pd.Series(index.date, index=data.index)).cumsum() / grouped_volume).where(mask)
     return data
+
+
+def session_name(timestamp: Any) -> str:
+    local_time = timestamp.timetz().replace(tzinfo=None)
+    if PREMARKET_START <= local_time.strftime("%H:%M") < PREMARKET_END:
+        return "PREMARKET"
+    if "09:30" <= local_time.strftime("%H:%M") < "16:00":
+        return "RTH"
+    return "OVERNIGHT"
 
 
 def volume_profile(data: pd.DataFrame, bins: int = 30) -> dict[str, float | None]:
@@ -97,6 +144,9 @@ def volume_profile(data: pd.DataFrame, bins: int = 30) -> dict[str, float | None
     prices = (pd.to_numeric(data["High"], errors="coerce") + pd.to_numeric(data["Low"], errors="coerce") + pd.to_numeric(data["Close"], errors="coerce")) / 3
     volumes = pd.to_numeric(data["Volume"], errors="coerce").fillna(0)
     valid = pd.DataFrame({"price": prices, "volume": volumes}).dropna()
+    valid = valid[valid["volume"] > 0]
+    if valid.empty:
+        return {"poc": None, "vah": None, "val": None}
     if valid.empty or valid["price"].nunique() < 2:
         price = clean_number(valid["price"].iloc[-1]) if not valid.empty else None
         return {"poc": price, "vah": price, "val": price}
@@ -126,9 +176,13 @@ def volume_profile_poc(data: pd.DataFrame, bins: int = 30) -> float | None:
 def session_profiles(data: pd.DataFrame) -> dict[str, Any]:
     index = data.index.tz_convert(NY_TZ) if getattr(data.index, "tz", None) else data.index.tz_localize(NY_TZ)
     sessions = pd.Series(index.date, index=data.index)
-    daily = {str(day): volume_profile(data.loc[sessions == day]) for day in sessions.unique()}
-    recent = data.loc[sessions.isin(sorted(sessions.unique())[-5:])]
-    return {"sessions": daily, "five_day": volume_profile(recent)}
+    names = pd.Series(index.map(session_name), index=data.index)
+    pm = data.loc[names == "PREMARKET"]
+    rth = data.loc[names == "RTH"]
+    days = sorted(set(sessions[names == "RTH"]))
+    five = data.loc[sessions.isin(days[-5:]) & (names == "RTH")]
+    twenty = data.loc[sessions.isin(days[-20:]) & (names == "RTH")]
+    return {"PM": volume_profile(pm), "RTH": volume_profile(rth), "5RTH": volume_profile(five), "20RTH": volume_profile(twenty), "volume_bars": {"PM": int((pm["Volume"] > 0).sum()), "RTH": int((rth["Volume"] > 0).sum()), "5RTH": int((five["Volume"] > 0).sum()), "20RTH": int((twenty["Volume"] > 0).sum())}}
 
 
 def prepare_chart_data(data: pd.DataFrame, interval: str) -> pd.DataFrame:
@@ -146,7 +200,7 @@ def save_chart(symbol: str, interval: str, data: pd.DataFrame, output: Path) -> 
         price_axis.add_patch(Rectangle((x_value - candle_width / 2, min(row["Open"], row["Close"])), candle_width, max(abs(row["Close"] - row["Open"]), 0.0001), facecolor=color, edgecolor=color, linewidth=0.5))
     for length, color in ((20, "#e76f51"), (50, "#2a9d8f"), (200, "#e9c46a")):
         price_axis.plot(data.index, data[f"EMA{length}"], label=f"EMA {length}", linewidth=1)
-    price_axis.plot(data.index, data["VWAP"], label="VWAP", color="#7b2cbf", linewidth=1)
+    price_axis.plot(data.index, pd.to_numeric(data["VWAP"], errors="coerce"), label="VWAP", color="#7b2cbf", linewidth=1)
     if profile["poc"] is not None:
         price_axis.axhline(profile["poc"], label=f"POC {profile['poc']:.2f}", color="#d62828", linewidth=1, linestyle="--")
         price_axis.axhline(profile["vah"], label=f"VAH {profile['vah']:.2f}", color="#457b9d", linewidth=0.8, linestyle=":")
@@ -174,7 +228,13 @@ def quote(symbol: str) -> Quote:
     current = clean_number(history["Close"].iloc[-1])
     previous = clean_number(history["Close"].iloc[-2]) if len(history) > 1 else None
     change = (current / previous - 1) * 100 if current is not None and previous else None
-    return Quote(symbol, current, change, history.index[-1].isoformat())
+    info = getattr(ticker, "fast_info", {})
+    bid = clean_number(info.get("bid"))
+    ask = clean_number(info.get("ask"))
+    spread = ask - bid if bid is not None and ask is not None and ask >= bid else None
+    age_minutes = (datetime.now(timezone.utc) - history.index[-1].to_pydatetime().astimezone(timezone.utc)).total_seconds() / 60
+    quality = "OK" if age_minutes <= 30 else "STALE"
+    return Quote(symbol, current, change, history.index[-1].isoformat(), bid, ask, spread, quality)
 
 
 def atr14(data: pd.DataFrame) -> float | None:
@@ -208,7 +268,16 @@ def trading_context(data: pd.DataFrame) -> dict[str, Any]:
     prem = local[(local.index.date == today) & (local.index.strftime("%H:%M") >= PREMARKET_START) & (local.index.strftime("%H:%M") < PREMARKET_END)]
     current_open = clean_number(today_regular["Open"].iloc[0]) if not today_regular.empty else (clean_number(prem["Open"].iloc[0]) if not prem.empty else None)
     prior_close = clean_number(previous["Close"].iloc[-1]) if not previous.empty else None
-    return {"previous_day": ohlc_summary(previous), "premarket": ohlc_summary(prem), "gap_pct": (current_open / prior_close - 1) * 100 if current_open is not None and prior_close else None, "atr14": atr14(data)}
+    previous_days = sorted(set(regular.index.date))
+    regular_days = pd.Series(regular.index.date, index=regular.index)
+    previous_week = regular.loc[regular_days.isin(previous_days[-6:-1])]
+    overnight = local[(local.index.date == today) & (local.index.strftime("%H:%M") >= "16:00")]
+    today_rth = regular[regular.index.date == today]
+    opening = today_rth.iloc[:15] if not today_rth.empty else prem.iloc[:15]
+    opening5 = today_rth.iloc[:5] if not today_rth.empty else prem.iloc[:5]
+    prior_daily = [regular[regular.index.date == day]["Volume"].sum() for day in previous_days[-21:-1]]
+    today_volume = today_rth["Volume"].sum() if not today_rth.empty else prem["Volume"].sum()
+    return {"previous_day": ohlc_summary(previous), "previous_week": ohlc_summary(previous_week), "premarket": ohlc_summary(prem), "overnight": ohlc_summary(overnight), "gap_pct": (current_open / prior_close - 1) * 100 if current_open is not None and prior_close else None, "or5": ohlc_summary(opening5), "or15": ohlc_summary(opening), "atr14": atr14(data), "rvol": clean_number(today_volume / (sum(prior_daily) / len(prior_daily))) if prior_daily and sum(prior_daily) else None}
 
 
 def options(symbol: str) -> dict[str, Any]:
@@ -242,8 +311,10 @@ def options(symbol: str) -> dict[str, Any]:
             chain = ticker.option_chain(expiry)
             rows = pd.concat([chain.calls.assign(type="call"), chain.puts.assign(type="put")])
             rows = valid_option_rows(rows, spot)
+            coverage = int(rows["strike"].nunique()) if not rows.empty else 0
+            category_quality = "OK" if coverage >= 8 and set(rows["type"]) == {"call", "put"} else "LOW QUALITY"
             if rows.empty:
-                result_categories[category] = {"expiry": expiry, "data_as_of": captured_at, "rows": [], "walls": gamma_walls(rows)}
+                result_categories[category] = {"expiry": expiry, "data_as_of": captured_at, "quality": "LOW QUALITY", "strike_coverage": 0, "rows": [], "walls": gamma_walls(rows)}
                 continue
             days_to_expiry = max((expiry_date - today).days, 0)
             rows["gamma"] = rows.apply(lambda row: option_gamma(spot, row["strike"], row["impliedVolatility"], days_to_expiry), axis=1)
@@ -251,8 +322,8 @@ def options(symbol: str) -> dict[str, Any]:
             rows.loc[rows["type"] == "put", "gammaExposure"] *= -1
             walls = gamma_walls(rows)
             top = rows.sort_values(["openInterest", "volume"], ascending=False).head(12)
-            result_categories[category] = {"expiry": expiry, "data_as_of": captured_at, "rows": top.to_dict("records"), "walls": walls}
-        return {"symbol": symbol, "available": bool(result_categories), "spot": spot, "categories": result_categories, "data_as_of": captured_at}
+            result_categories[category] = {"expiry": expiry, "data_as_of": captured_at, "quality": category_quality, "strike_coverage": coverage, "rows": top.to_dict("records"), "walls": walls if category_quality == "OK" else gamma_walls(pd.DataFrame())}
+        return {"symbol": symbol, "available": bool(result_categories), "quality": "OK" if any(item.get("quality") == "OK" for item in result_categories.values()) else "LOW QUALITY", "spot": spot, "categories": result_categories, "data_as_of": captured_at}
     except Exception as error:  # Yahoo options can be unavailable outside market hours.
         return {"symbol": symbol, "available": False, "error": str(error)}
 
@@ -313,7 +384,10 @@ def economic_calendar() -> dict[str, Any]:
                 for event in events if isinstance(events, list) else []:
                     if event.get("country") not in {"USD", "US"} or str(event.get("date", ""))[:10] != today:
                         continue
-                    rows.append({key: event.get(key, "") for key in ("title", "date", "impact", "actual", "forecast", "previous")})
+                    row = {key: event.get(key, "") for key in ("title", "date", "impact", "actual", "forecast", "previous")}
+                    row["importance"] = row.pop("impact")
+                    row["surprise"] = numeric_surprise(row.get("actual"), row.get("forecast"))
+                    rows.append(row)
                 return {"date": today, "available": True, "source": url, "events": rows}
             except (requests.RequestException, ValueError, TypeError) as error:
                 last_error = error
@@ -331,7 +405,7 @@ def fed_probabilities() -> dict[str, Any]:
             response.raise_for_status()
             data = response.json()
             meetings = data.get("meetings", data.get("data", [])) if isinstance(data, dict) else data
-            return {"available": True, "source": url, "as_of": datetime.now(timezone.utc).isoformat(), "next_fomc": next_fomc_date(), "meetings": meetings if isinstance(meetings, list) else []}
+            return {"available": True, "quality": "LOW CONFIDENCE", "source": url, "as_of": datetime.now(timezone.utc).isoformat(), "next_fomc": next_fomc_date(), "meetings": meetings if isinstance(meetings, list) else []}
         except (requests.RequestException, ValueError, TypeError) as error:
             last_error = error
     fallback_url = os.getenv("FEDWATCH_FALLBACK_URL", FEDWATCH_FALLBACK_URL)
@@ -341,6 +415,7 @@ def fed_probabilities() -> dict[str, Any]:
         fallback = parse_fedwatch_html(response.text, fallback_url)
         if fallback["meetings"]:
             fallback["next_fomc"] = next_fomc_date()
+            fallback["quality"] = "LOW CONFIDENCE"
             return fallback
     except (requests.RequestException, ValueError, TypeError) as error:
         last_error = error
@@ -380,23 +455,48 @@ def next_fomc_date() -> str | None:
         return None
 
 
+def numeric_surprise(actual: Any, forecast: Any) -> float | None:
+    actual_number = clean_number(str(actual).replace("%", "").replace(",", ""))
+    forecast_number = clean_number(str(forecast).replace("%", "").replace(",", ""))
+    return actual_number - forecast_number if actual_number is not None and forecast_number is not None else None
+
+
 def news() -> list[dict[str, str]]:
-    feed = feedparser.parse("https://news.google.com/rss/search?q=(semiconductor+OR+AI+OR+tariff+OR+geopolitics)+when:1d&hl=en-US&gl=US&ceid=US:en")
+    feeds = ["Reuters semiconductor stocks", "Bloomberg markets semiconductor", "CNBC Fed market", "WSJ technology stocks", "site:sec.gov semiconductor 8-k", "semiconductor investor relations"]
     cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
     impact_terms = ("fed", "fomc", "rate", "yield", "inflation", "tariff", "sanction", "chip", "semiconductor", "ai", "nvidia", "earnings", "guidance", "nasdaq", "s&p", "market")
     results = []
-    for item in feed.entries:
-        published = item.get("published_parsed") or item.get("updated_parsed")
-        published_at = datetime(*published[:6], tzinfo=timezone.utc) if published else None
-        title = item.get("title", "")
-        if published_at and published_at < cutoff:
-            continue
-        if not any(term in title.lower() for term in impact_terms):
-            continue
-        results.append({"title": title, "link": item.get("link", ""), "published_at": published_at.isoformat() if published_at else None})
-        if len(results) == 15:
-            break
+    seen = set()
+    for query in feeds:
+        feed = feedparser.parse(f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&when:2d&hl=en-US&gl=US&ceid=US:en")
+        for item in feed.entries:
+            published = item.get("published_parsed") or item.get("updated_parsed")
+            published_at = datetime(*published[:6], tzinfo=timezone.utc) if published else None
+            title = item.get("title", "")
+            key = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+            if key in seen or (published_at and published_at < cutoff) or not any(term in title.lower() for term in impact_terms):
+                continue
+            seen.add(key)
+            results.append({"title": title, "summary": title, "link": item.get("link", ""), "source": item.get("source", {}).get("title", query) if isinstance(item.get("source"), dict) else query, "published_at": published_at.isoformat() if published_at else None, "related_tickers": sorted(set(re.findall(r"\b(?:SOXX|SMH|QQQ|NVDA|AMD|AVGO|MU|TSM|SPY|ES|NQ)\b", title.upper())))})
+            if len(results) == 15:
+                return results
     return results
+
+
+def semiconductor_events() -> list[dict[str, Any]]:
+    events = []
+    cutoff = datetime.now(timezone.utc)
+    horizon = cutoff + timedelta(days=7)
+    for symbol in ("NVDA", "AMD", "AVGO", "MU", "TSM"):
+        try:
+            dates = yf.Ticker(symbol).get_earnings_dates(limit=8)
+            for timestamp in dates.index:
+                stamp = timestamp.to_pydatetime()
+                if cutoff <= stamp.astimezone(timezone.utc) <= horizon:
+                    events.append({"symbol": symbol, "event": "earnings", "as_of": stamp.isoformat(), "source": "Yahoo Finance/yfinance"})
+        except Exception:
+            continue
+    return events
 
 
 def fred_series(series_id: str) -> float | None:
@@ -417,6 +517,43 @@ def fred_observation(series_id: str) -> dict[str, Any]:
         return {"value": None, "as_of": None}
 
 
+def soxx_constituents() -> dict[str, Any]:
+    url = os.getenv("SOXX_HOLDINGS_URL", SOXX_HOLDINGS_URL)
+    try:
+        data = pd.read_csv(url, skiprows=9)
+        symbol_column = next((column for column in data.columns if str(column).lower() in {"ticker", "symbol"}), None)
+        weight_column = next((column for column in data.columns if "weight" in str(column).lower()), None)
+        if symbol_column is None or weight_column is None:
+            raise ValueError("SOXX holdings columns not found")
+        rows = data[[symbol_column, weight_column]].copy()
+        rows.columns = ["symbol", "weight"]
+        rows["weight"] = rows["weight"].astype(str).str.replace("%", "", regex=False).pipe(pd.to_numeric, errors="coerce") / 100
+        rows = rows.dropna().query("weight > 0")
+        rows["symbol"] = rows["symbol"].astype(str).str.strip()
+        return {"available": True, "source": url, "as_of": datetime.now(timezone.utc).isoformat(), "rows": rows.head(30).to_dict("records")}
+    except (requests.RequestException, ValueError, OSError, pd.errors.ParserError) as error:
+        return {"available": False, "source": url, "as_of": None, "rows": [], "error": str(error)}
+
+
+def breadth_and_relative_strength(holdings: dict[str, Any], quotes: dict[str, Any]) -> dict[str, Any]:
+    rows = holdings.get("rows", [])
+    weighted_up = sum(row["weight"] for row in rows if quotes.get(row["symbol"], {}).get("change_pct", 0) > 0)
+    contribution = sorted(({"symbol": row["symbol"], "weight": row["weight"], "change_pct": quotes.get(row["symbol"], {}).get("change_pct"), "contribution_pct": row["weight"] * (quotes.get(row["symbol"], {}).get("change_pct") or 0)} for row in rows if row["symbol"] in quotes), key=lambda row: abs(row["contribution_pct"] or 0), reverse=True)[:10]
+    return {"weighted_breadth": weighted_up if rows else None, "top_constituent_contribution": contribution}
+
+
+def relative_strength(data: dict[str, pd.DataFrame]) -> dict[str, Any]:
+    result = {}
+    for left, right in (("SOXX", "QQQ"), ("SMH", "QQQ")):
+        if left not in data or right not in data or data[left].empty or data[right].empty:
+            result[f"{left}/{right}"] = None
+            continue
+        left_return = data[left]["Close"].iloc[-1] / data[left]["Close"].iloc[max(0, len(data[left]) - 20)] - 1
+        right_return = data[right]["Close"].iloc[-1] / data[right]["Close"].iloc[max(0, len(data[right]) - 20)] - 1
+        result[f"{left}/{right}"] = {"relative_return_pct": (left_return - right_return) * 100, "as_of": data[left].index[-1].isoformat()}
+    return result
+
+
 def format_value(value: float | None, suffix: str = "") -> str:
     return f"{value:,.2f}{suffix}" if value is not None else "N/A"
 
@@ -426,25 +563,42 @@ def build_report(output: Path) -> Path:
     generated_at = datetime.now(timezone.utc)
     chart_files: list[dict[str, str]] = []
     chart_stats: list[dict[str, Any]] = []
+    raw_data: dict[str, pd.DataFrame] = {}
+    quality_table: list[dict[str, Any]] = []
     for symbol, intervals in CHARTS.items():
         for interval in intervals:
             data = download(symbol, interval)
             if data.empty:
+                quality_table.append({"item": f"{symbol}/{interval}", "status": "MISSING", "source": "Yahoo Finance/yfinance", "as_of": None})
                 continue
+            raw_data[f"{symbol}/{interval}"] = data
             chart_data = prepare_chart_data(data, interval)
             csv_name = f"{symbol.lower()}-{interval.replace('m', 'min').replace('h', 'hour')}-ohlcv.csv"
             chart_data[["Open", "High", "Low", "Close", "Volume"]].to_csv(output / csv_name, index_label="timestamp")
             chart_files.append({"symbol": symbol, "interval": interval, "file": save_chart(symbol, interval, chart_data, output)})
             latest = chart_data.iloc[-1]
             profile = volume_profile(chart_data)
-            chart_stats.append({"symbol": symbol, "interval": interval, "visible_bars": len(chart_data), "latest_timestamp": chart_data.index[-1].isoformat(), "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": clean_number(latest["VWAP"]), "poc": profile["poc"], "vah": profile["vah"], "val": profile["val"], "session_profiles": session_profiles(chart_data), "context": trading_context(data), "ohlcv_csv": csv_name, "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
+            quality = data_quality(data, 400 if interval != "1d" else 250)
+            quality_table.append({"item": f"{symbol}/{interval}", **quality})
+            chart_stats.append({"symbol": symbol, "interval": interval, "visible_bars": len(chart_data), "latest_timestamp": chart_data.index[-1].isoformat(), "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": clean_number(latest["VWAP"]), "vwap_premarket": clean_number(latest.get("VWAP_PREMARKET")), "vwap_rth": clean_number(latest.get("VWAP_RTH")), "vwap_previous_rth": None, "poc": profile["poc"], "vah": profile["vah"], "val": profile["val"], "session_profiles": session_profiles(chart_data), "context": trading_context(data), "ohlcv_csv": csv_name, "quality": quality, "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
     market_quotes = {name: asdict(quote(symbol)) for name, symbol in MARKET.items()}
+    quality_table.extend({"item": name, "status": item.get("quality", "MISSING"), "source": "Yahoo Finance/yfinance", "as_of": item.get("as_of")} for name, item in market_quotes.items())
     dgs2 = fred_observation("DGS2")
     market_quotes["미국채 2년 금리"] = {"symbol": "DGS2", "price": dgs2["value"], "change_pct": None, "as_of": dgs2["as_of"]}
     semiconductor_quotes = {name: asdict(quote(symbol)) for name, symbol in SEMIS.items()}
-    options_data = [options(symbol) for symbol in ("SOXX", "NVDA", "AMD", "AVGO", "MU", "TSM")]
+    holdings = soxx_constituents()
+    holding_symbols = {row["symbol"] for row in holdings.get("rows", [])}
+    holding_quotes = {symbol: asdict(quote(symbol)) for symbol in holding_symbols if symbol not in semiconductor_quotes}
+    breadth = breadth_and_relative_strength(holdings, {**semiconductor_quotes, **holding_quotes})
+    options_data = [options(symbol) for symbol in ("SOXX", "QQQ", "NVDA", "SMH")]
     dgs10 = fred_observation("DGS10")
-    payload = {"generated_at": generated_at.isoformat(), "charts": chart_stats, "chart_files": chart_files, "market": market_quotes, "semiconductors": semiconductor_quotes, "options": options_data, "economic_calendar": economic_calendar(), "fed_probabilities": fed_probabilities(), "news": news(), "macro": {"DGS2": dgs2, "DGS10": dgs10}, "data_notes": ["1분봉은 Yahoo Finance 제공 제한 때문에 최근 7일만 수집합니다.", "옵션 감마는 유효한 bid/ask·IV·미결제약정과 현물가 ±20% 범위에서 계산한 추정치입니다."]}
+    real10 = fred_observation("DFII10")
+    quality_table.extend([{"item": "FRED/DGS2", "status": "OK" if dgs2["value"] is not None else "MISSING", "source": "FRED", "as_of": dgs2["as_of"]}, {"item": "FRED/DGS10", "status": "OK" if dgs10["value"] is not None else "MISSING", "source": "FRED", "as_of": dgs10["as_of"]}, {"item": "FRED/DFII10 real yield", "status": "OK" if real10["value"] is not None else "MISSING", "source": "FRED", "as_of": real10["as_of"]}, {"item": "SOXX holdings", "status": "OK" if holdings["available"] else "LOW QUALITY", "source": holdings["source"], "as_of": holdings["as_of"]}])
+    calendar = economic_calendar()
+    fed = fed_probabilities()
+    news_items = news()
+    quality_table.extend([{"item": "options", "status": "OK" if any(item.get("quality") == "OK" for item in options_data) else "LOW QUALITY", "source": "Yahoo Finance/yfinance", "as_of": datetime.now(timezone.utc).isoformat()}, {"item": "FedWatch", "status": fed.get("quality", "MISSING") if fed.get("meetings") else "MISSING", "source": fed.get("source"), "as_of": fed.get("as_of")}, {"item": "economic calendar", "status": "OK" if calendar.get("available") else "MISSING", "source": calendar.get("source"), "as_of": calendar.get("date")}, {"item": "news", "status": "OK" if news_items else "LOW QUALITY", "source": "filtered Google News RSS", "as_of": generated_at.isoformat()}])
+    payload = {"generated_at": generated_at.isoformat(), "charts": chart_stats, "chart_files": chart_files, "market": market_quotes, "semiconductors": semiconductor_quotes, "options": options_data, "economic_calendar": calendar, "fed_probabilities": fed, "news": news_items, "semiconductor_events": semiconductor_events(), "macro": {"DGS2": dgs2, "DGS10": dgs10, "DFII10": real10}, "breadth": breadth, "relative_strength": relative_strength({symbol: raw_data[key] for symbol, key in (("SOXX", "SOXX/5m"), ("QQQ", "QQQ/5m"), ("SMH", "SMH/5m")) if key in raw_data}), "soxx_holdings": holdings, "quality": quality_table, "data_notes": ["1분봉은 Yahoo Finance 제공 제한 때문에 최근 7일만 수집합니다.", "EMA200은 intraday 400 bars, 일봉 250 거래일 이상 warm-up 후 계산합니다.", "옵션 감마는 유효한 bid/ask·IV·미결제약정과 현물가 ±20% 범위에서 계산한 추정치입니다."]}
     (output / "report.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     pd.DataFrame(chart_stats).to_csv(output / "indicators.csv", index=False)
     report_path = output / "market-brief.md"
@@ -467,15 +621,15 @@ def render_markdown(payload: dict[str, Any]) -> str:
     for item in payload["options"]:
         for category, details in item.get("categories", {}).items():
             walls = details.get("walls", {})
-            lines.append(f"| {item['symbol']} | {category} | {details.get('expiry', 'N/A')} | {details.get('data_as_of', 'N/A')} | {format_value(walls.get('totalGammaExposure'))} | {format_value(walls.get('callWall'))} | {format_value(walls.get('putWall'))} | {format_value(walls.get('gammaFlip'))} |")
+            lines.append(f"| {item['symbol']} | {category} ({details.get('quality', 'N/A')}) | {details.get('expiry', 'N/A')} | {details.get('data_as_of', 'N/A')} | {format_value(walls.get('totalGammaExposure'))} | {format_value(walls.get('callWall'))} | {format_value(walls.get('putWall'))} | {format_value(walls.get('gammaFlip'))} |")
             for row in details.get("rows", []):
                 lines.append(f"| {item['symbol']} {category} | {details.get('expiry', 'N/A')} | {row.get('type', '')} | {row.get('strike', '')} | {row.get('openInterest', 0)} | {row.get('volume', 0)} | {format_value(row.get('gamma'))} | {format_value(row.get('gammaExposure'))} |")
     calendar = payload["economic_calendar"]
-    lines += ["", "## 당일 경제지표", "| 시각 | 지표 | 중요도 | 실제 | 예상 | 이전 |", "|---|---|---|---:|---:|---:|"]
+    lines += ["", "## 당일 경제지표", "| 시각 | 지표 | 중요도 | 실제 | 예상 | 이전 | Surprise |", "|---|---|---|---:|---:|---:|---:|"]
     for event in calendar.get("events", []):
-        lines.append(f"| {event.get('date', '')} | {event.get('title', '')} | {event.get('impact', '')} | {event.get('actual', '') or 'N/A'} | {event.get('forecast', '') or 'N/A'} | {event.get('previous', '') or 'N/A'} |")
+        lines.append(f"| {event.get('date', '')} | {event.get('title', '')} | {event.get('importance', '')} | {event.get('actual', '') or 'N/A'} | {event.get('forecast', '') or 'N/A'} | {event.get('previous', '') or 'N/A'} | {event.get('surprise', 'N/A')} |")
     if not calendar.get("events"):
-        lines.append("| - | 당일 미국 경제지표 없음 또는 데이터 미수신 | - | N/A | N/A | N/A |")
+        lines.append("| - | 당일 미국 경제지표 없음 또는 데이터 미수신 | - | N/A | N/A | N/A | N/A |")
     fed = payload["fed_probabilities"]
     lines += ["", "## Fed 금리확률"]
     if fed.get("meetings"):
@@ -487,8 +641,12 @@ def render_markdown(payload: dict[str, Any]) -> str:
                 lines.append(f"- {meeting}")
     else:
         lines.append("- N/A: FedWatch 데이터가 제공되지 않았습니다.")
-    lines += ["", "## 매크로 참고", f"- FRED 2년물: {format_value(payload['macro']['DGS2']['value'], '%')} (시각 {payload['macro']['DGS2']['as_of']})", f"- FRED 10년물: {format_value(payload['macro']['DGS10']['value'], '%')} (시각 {payload['macro']['DGS10']['as_of']})", "- 경제지표 실제값/예상값은 공개 캘린더, Fed 금리확률은 FedWatch 데이터 응답이 제공하는 범위만 표시합니다.", "", "## 주요 뉴스"]
-    lines += [f"- [{item['title']}]({item['link']}) ({item.get('published_at', 'timestamp N/A')})" for item in payload["news"]]
+    lines += ["", "## Breadth / Relative Strength", f"- SOXX weighted breadth: {format_value(payload['breadth'].get('weighted_breadth'), '%')}", f"- Relative strength: {payload.get('relative_strength', {})}", "", "## 향후 7일 반도체 이벤트"]
+    lines += [f"- {item['symbol']} {item['event']} · {item['as_of']}" for item in payload.get("semiconductor_events", [])] or ["- N/A"]
+    lines += ["", "## 데이터 품질", "| 항목 | 상태 | 출처 | 기준 시각 |", "|---|---|---|---|"]
+    lines += [f"| {item.get('item')} | {item.get('status')} | {item.get('source')} | {item.get('as_of')} |" for item in payload.get("quality", [])]
+    lines += ["", "## 매크로 참고", f"- FRED 2년물: {format_value(payload['macro']['DGS2']['value'], '%')} (시각 {payload['macro']['DGS2']['as_of']})", f"- FRED 10년물: {format_value(payload['macro']['DGS10']['value'], '%')} (시각 {payload['macro']['DGS10']['as_of']})", f"- FRED 10년 실질금리: {format_value(payload['macro']['DFII10']['value'], '%')} (시각 {payload['macro']['DFII10']['as_of']})", "- 경제지표 실제값/예상값은 공개 캘린더, Fed 금리확률은 FedWatch 데이터 응답이 제공하는 범위만 표시합니다.", "", "## 주요 뉴스"]
+    lines += [f"- [{item['title']}]({item['link']}) · {item.get('source', 'N/A')} · {item.get('published_at', 'timestamp N/A')} · {item.get('summary', item['title'])} · {','.join(item.get('related_tickers', []))}" for item in payload["news"]]
     lines += ["", "## 첨부 차트", *[f"- `{item['file']}`" for item in payload["chart_files"]], "", "> 이 파일은 정보 제공용 자동 수집물이며 투자 조언이 아닙니다."]
     return "\n".join(lines) + "\n"
 
