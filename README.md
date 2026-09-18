@@ -6,8 +6,9 @@
 
 - `market-brief.md`: ChatGPT에 업로드하기 좋은 요약 문서
 - `report.json`: 원본 구조화 데이터
-- `indicators.csv`: 차트별 EMA 20/50/200, RSI(14), VWAP, 종가
-- `*.png`: SOXX 1분/5분/30분/1시간/일봉, NVDA 5분, QQQ 5분 차트
+- `indicators.csv`: 차트별 EMA 20/50/200, RSI(14), 일별 reset VWAP, POC/VAH/VAL, gap, ATR14
+- `*.png`: extended-hours OHLC 캔들 차트
+- `*-ohlcv.csv`: 각 심볼/타임프레임의 timestamp, OHLCV 원본
 
 ## 실행
 
@@ -39,11 +40,13 @@ python market_report.py --output reports/manual
 
 ## 데이터 범위와 한계
 
-Yahoo Finance는 1분봉을 최근 7일만 제공하므로 SOXX 1분 차트는 그 범위만 생성됩니다. 옵션은 가장 가까운 만기의 주요 미결제약정/거래량 행사가를 표시하며, Yahoo 데이터만으로 신뢰할 수 있는 감마 계산은 하지 않습니다.
+Yahoo Finance는 1분봉을 최근 7일만 제공하므로 SOXX 1분 차트는 그 범위만 생성됩니다. 모든 intraday 수집은 extended hours를 포함하고 최신 캔들의 timestamp를 기록합니다. 차트는 OHLC 캔들로 표시하며 VWAP은 뉴욕 거래일마다 reset됩니다.
+
+시세·차트·옵션·FRED·뉴스 데이터에는 가능한 경우 원천 데이터의 최신 timestamp를 붙입니다. 뉴스는 최근 48시간 내 제목에서 금리, Fed/FOMC, 수익, 반도체/AI, 관세, 지수·시장 등 영향 키워드가 확인되는 항목만 표시합니다.
 
 현재 보고서에는 FRED 2년/10년 금리와 공개 경제 캘린더의 당일 미국 이벤트(실제값/예상값/이전값)를 포함합니다. FedWatch 데이터는 기본 CME 엔드포인트를 사용하며, 실행 환경에서 접근할 수 있는 JSON 엔드포인트가 따로 있으면 `FEDWATCH_URL` 환경변수로 지정할 수 있습니다. 응답이 없을 때는 보고서 생성을 중단하지 않고 `N/A`로 표시합니다.
 
-옵션 Gamma는 Yahoo Finance의 가장 가까운 만기 체인에서 내재변동성, 미결제약정, 현물가를 사용해 Black-Scholes Gamma를 추정하고, 계약 승수 100과 1% 가격변화를 반영한 Gamma Exposure를 계산합니다. Call Wall은 행사가별 call Gamma Exposure 최대값, Put Wall은 put Gamma Exposure 최소값이며, 리포트에 기준 만기일과 데이터 시각(UTC)을 함께 표시합니다. Volume POC는 각 차트에 실제로 표시하는 visible range를 사용하며, 차트와 요약이 동일한 주기별 봉 구간을 공유합니다.
+옵션은 0DTE/weekly/monthly 대표 만기별로 spot ±20%, 양의 bid/ask, 양의 IV와 미결제약정이 있는 행만 사용합니다. Gamma Exposure, Call Wall, Put Wall, Gamma Flip과 기준 만기일/수집 시각을 표시합니다. Volume Profile은 visible range의 POC/VAH/VAL과 session/최근 5거래일 프로파일을 제공합니다. 전일 OHLC, 프리마켓 OHLC, gap, ATR14도 함께 기록합니다.
 
 Fed 금리확률은 CME FedWatch를 먼저 시도하고, CME가 차단되면 ZQ 선물 기반 확률을 공개하는 FedWatch monitor 결과를 fallback으로 읽습니다. fallback 결과의 기준일과 출처도 리포트에 표시되며, 두 소스 모두 실패한 경우에만 `N/A`가 됩니다.
 
