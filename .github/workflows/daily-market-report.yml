@@ -3,8 +3,9 @@ name: Daily market report
 on:
   workflow_dispatch:
   schedule:
-    # 03:00 UTC = 12:00 KST. GitHub Actions schedules use UTC.
-    - cron: "0 3 * * 1-5"
+    # 00:00 UTC = 09:00 KST, 07:00 UTC = 16:00 KST. Schedules use UTC.
+    - cron: "0 0 * * 1-5"
+    - cron: "0 7 * * 1-5"
 
 permissions:
   contents: read
