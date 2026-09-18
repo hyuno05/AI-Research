@@ -20,6 +20,15 @@ python market_report.py --output reports/manual
 
 로컬에서 Python을 실행하고 싶지 않다면 저장소를 GitHub에 올린 뒤 `Actions` 탭에서 `Daily market report`를 한 번 수동 실행하세요. 이후 평일 12:00 KST에 GitHub 서버가 자동 실행하고, 실행 결과는 해당 workflow의 `Artifacts`에서 다운로드할 수 있습니다. 이 방식은 `.github/workflows/daily-market-report.yml`에 설정되어 있습니다.
 
+## Discord 자동 전송
+
+1. Discord 서버의 채널 설정에서 `연동` → `웹후크` → `새 웹후크`를 만듭니다.
+2. Webhook URL을 복사합니다. URL은 다른 사람에게 공개하지 마세요.
+3. GitHub 저장소의 `Settings` → `Secrets and variables` → `Actions` → `New repository secret`으로 이동합니다.
+4. 이름을 `DISCORD_WEBHOOK_URL`, 값에 복사한 URL을 입력합니다.
+
+다음 workflow 실행부터 생성된 보고서 ZIP이 Discord 채널에 첨부됩니다. Secret을 등록하지 않아도 보고서 생성과 GitHub Artifact 업로드는 계속 동작합니다.
+
 매일 12:00 KST에 실행하려면 서버의 `crontab -e`에 다음을 등록합니다.
 
 ```cron

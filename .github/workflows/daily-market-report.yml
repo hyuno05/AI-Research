@@ -34,3 +34,17 @@ jobs:
           name: market-report-${{ github.run_id }}
           path: reports/
           retention-days: 14
+
+      - name: Send report to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "DISCORD_WEBHOOK_URL is not configured; skipping Discord delivery."
+            exit 0
+          fi
+          zip -qr market-report.zip reports/
+          curl --fail-with-body --retry 2 \
+            -F 'payload_json={"content":"오늘의 미국장 반도체·매크로 보고서입니다."}' \
+            -F 'file1=@market-report.zip' \
+            "$DISCORD_WEBHOOK_URL"
