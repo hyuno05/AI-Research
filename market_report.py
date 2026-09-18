@@ -8,6 +8,8 @@ files so it can be attached to ChatGPT or delivered by a separate messenger job.
 from __future__ import annotations
 
 import argparse
+import html
+import io
 import json
 import math
 import os
@@ -200,7 +202,8 @@ def save_chart(symbol: str, interval: str, data: pd.DataFrame, output: Path) -> 
         price_axis.add_patch(Rectangle((x_value - candle_width / 2, min(row["Open"], row["Close"])), candle_width, max(abs(row["Close"] - row["Open"]), 0.0001), facecolor=color, edgecolor=color, linewidth=0.5))
     for length, color in ((20, "#e76f51"), (50, "#2a9d8f"), (200, "#e9c46a")):
         price_axis.plot(data.index, data[f"EMA{length}"], label=f"EMA {length}", linewidth=1)
-    price_axis.plot(data.index, pd.to_numeric(data["VWAP"], errors="coerce"), label="VWAP", color="#7b2cbf", linewidth=1)
+    if interval != "1d":
+        price_axis.plot(data.index, pd.to_numeric(data["VWAP"], errors="coerce"), label="VWAP", color="#7b2cbf", linewidth=1)
     if profile["poc"] is not None:
         price_axis.axhline(profile["poc"], label=f"POC {profile['poc']:.2f}", color="#d62828", linewidth=1, linestyle="--")
         price_axis.axhline(profile["vah"], label=f"VAH {profile['vah']:.2f}", color="#457b9d", linewidth=0.8, linestyle=":")
@@ -251,7 +254,7 @@ def ohlc_summary(data: pd.DataFrame) -> dict[str, Any]:
     return {"open": clean_number(data["Open"].iloc[0]), "high": clean_number(data["High"].max()), "low": clean_number(data["Low"].min()), "close": clean_number(data["Close"].iloc[-1]), "volume": clean_number(data["Volume"].sum()), "as_of": data.index[-1].isoformat()}
 
 
-def trading_context(data: pd.DataFrame) -> dict[str, Any]:
+def trading_context(data: pd.DataFrame, canonical_previous_close: float | None = None) -> dict[str, Any]:
     if data.empty:
         return {}
     local_index = data.index.tz_convert(NY_TZ) if getattr(data.index, "tz", None) else data.index.tz_localize(NY_TZ)
@@ -261,23 +264,39 @@ def trading_context(data: pd.DataFrame) -> dict[str, Any]:
     regular = local.between_time("09:30", "16:00")
     days = sorted(set(regular.index.date))
     if not days:
-        return {"previous_day": ohlc_summary(pd.DataFrame()), "premarket": ohlc_summary(pd.DataFrame()), "gap_pct": None, "atr14": atr14(data)}
+        empty = ohlc_summary(pd.DataFrame())
+        return {"previous_day": empty, "previous_week": empty, "premarket": ohlc_summary(local[(local.index.date == today) & (local.index.strftime("%H:%M") >= PREMARKET_START) & (local.index.strftime("%H:%M") < PREMARKET_END)]), "overnight": empty, "gap_pct": None, "or5": empty, "or15": empty, "atr14": atr14(data), "rvol": None}
     previous_day = days[-2] if len(days) > 1 and days[-1] == today else days[-1]
     previous = regular[regular.index.date == previous_day]
     today_regular = regular[regular.index.date == today]
     prem = local[(local.index.date == today) & (local.index.strftime("%H:%M") >= PREMARKET_START) & (local.index.strftime("%H:%M") < PREMARKET_END)]
     current_open = clean_number(today_regular["Open"].iloc[0]) if not today_regular.empty else (clean_number(prem["Open"].iloc[0]) if not prem.empty else None)
-    prior_close = clean_number(previous["Close"].iloc[-1]) if not previous.empty else None
+    prior_close = canonical_previous_close if canonical_previous_close is not None else (clean_number(previous["Close"].iloc[-1]) if not previous.empty else None)
     previous_days = sorted(set(regular.index.date))
     regular_days = pd.Series(regular.index.date, index=regular.index)
     previous_week = regular.loc[regular_days.isin(previous_days[-6:-1])]
     overnight = local[(local.index.date == today) & (local.index.strftime("%H:%M") >= "16:00")]
     today_rth = regular[regular.index.date == today]
-    opening = today_rth.iloc[:15] if not today_rth.empty else prem.iloc[:15]
-    opening5 = today_rth.iloc[:5] if not today_rth.empty else prem.iloc[:5]
+    opening = today_rth.iloc[:15] if not today_rth.empty else pd.DataFrame()
+    opening5 = today_rth.iloc[:5] if not today_rth.empty else pd.DataFrame()
     prior_daily = [regular[regular.index.date == day]["Volume"].sum() for day in previous_days[-21:-1]]
     today_volume = today_rth["Volume"].sum() if not today_rth.empty else prem["Volume"].sum()
     return {"previous_day": ohlc_summary(previous), "previous_week": ohlc_summary(previous_week), "premarket": ohlc_summary(prem), "overnight": ohlc_summary(overnight), "gap_pct": (current_open / prior_close - 1) * 100 if current_open is not None and prior_close else None, "or5": ohlc_summary(opening5), "or15": ohlc_summary(opening), "atr14": atr14(data), "rvol": clean_number(today_volume / (sum(prior_daily) / len(prior_daily))) if prior_daily and sum(prior_daily) else None}
+
+
+def canonical_rth_close(symbol: str) -> float | None:
+    try:
+        data = yf.download(symbol, period="10d", interval="1d", auto_adjust=False, progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        if data.empty:
+            return None
+        local_dates = pd.DatetimeIndex(data.index).tz_localize(NY_TZ) if data.index.tz is None else data.index.tz_convert(NY_TZ)
+        today = datetime.now(NY_TZ).date()
+        eligible = data.loc[[value < today for value in local_dates.date]]
+        return clean_number(eligible["Close"].iloc[-1]) if not eligible.empty else clean_number(data["Close"].iloc[-1])
+    except Exception:
+        return None
 
 
 def options(symbol: str) -> dict[str, Any]:
@@ -334,6 +353,10 @@ def valid_option_rows(rows: pd.DataFrame, spot: float | None) -> pd.DataFrame:
         rows[column] = pd.to_numeric(rows.get(column), errors="coerce")
     rows = rows.dropna(subset=["strike", "bid", "ask", "impliedVolatility", "openInterest"])
     rows = rows[(rows["bid"] > 0) & (rows["ask"] >= rows["bid"]) & (rows["impliedVolatility"] > 0) & (rows["openInterest"] > 0)]
+    if "lastTradeDate" in rows:
+        traded_at = pd.to_datetime(rows["lastTradeDate"], utc=True, errors="coerce")
+        age_hours = (pd.Timestamp.now(tz="UTC") - traded_at).dt.total_seconds() / 3600
+        rows = rows[age_hours <= 48]
     if spot is not None:
         rows = rows[rows["strike"].between(spot * 0.8, spot * 1.2)]
     return rows
@@ -405,7 +428,7 @@ def fed_probabilities() -> dict[str, Any]:
             response.raise_for_status()
             data = response.json()
             meetings = data.get("meetings", data.get("data", [])) if isinstance(data, dict) else data
-            return {"available": True, "quality": "LOW CONFIDENCE", "source": url, "as_of": datetime.now(timezone.utc).isoformat(), "next_fomc": next_fomc_date(), "meetings": meetings if isinstance(meetings, list) else []}
+            return {"available": True, "quality": "LOW CONFIDENCE", "cross_validation": "PENDING FED FUNDS FUTURES CHECK", "source": url, "as_of": datetime.now(timezone.utc).isoformat(), "next_fomc": next_fomc_date(), "meetings": meetings if isinstance(meetings, list) else []}
         except (requests.RequestException, ValueError, TypeError) as error:
             last_error = error
     fallback_url = os.getenv("FEDWATCH_FALLBACK_URL", FEDWATCH_FALLBACK_URL)
@@ -416,6 +439,7 @@ def fed_probabilities() -> dict[str, Any]:
         if fallback["meetings"]:
             fallback["next_fomc"] = next_fomc_date()
             fallback["quality"] = "LOW CONFIDENCE"
+            fallback["cross_validation"] = "CME UNAVAILABLE; FED FUNDS FUTURES SOURCE ONLY"
             return fallback
     except (requests.RequestException, ValueError, TypeError) as error:
         last_error = error
@@ -477,7 +501,14 @@ def news() -> list[dict[str, str]]:
             if key in seen or (published_at and published_at < cutoff) or not any(term in title.lower() for term in impact_terms):
                 continue
             seen.add(key)
-            results.append({"title": title, "summary": title, "link": item.get("link", ""), "source": item.get("source", {}).get("title", query) if isinstance(item.get("source"), dict) else query, "published_at": published_at.isoformat() if published_at else None, "related_tickers": sorted(set(re.findall(r"\b(?:SOXX|SMH|QQQ|NVDA|AMD|AVGO|MU|TSM|SPY|ES|NQ)\b", title.upper())))})
+            raw_summary = re.sub(r"<[^>]+>", " ", item.get("summary", ""))
+            summary = re.sub(r"\s+", " ", html.unescape(raw_summary)).strip()[:500] or title
+            paths = []
+            for term, path in (("fed", "금리·할인율"), ("rate", "금리·할인율"), ("yield", "채권금리"), ("inflation", "인플레이션·정책"), ("tariff", "관세·공급망"), ("chip", "반도체 공급망"), ("semiconductor", "반도체 공급망"), ("earnings", "실적·가이던스"), ("ai", "AI 수요")):
+                if term in title.lower() and path not in paths:
+                    paths.append(path)
+            impact_path = " → ".join(paths)
+            results.append({"title": title, "summary": summary, "impact_path": impact_path or "시장 심리", "link": item.get("link", ""), "source": item.get("source", {}).get("title", query) if isinstance(item.get("source"), dict) else query, "published_at": published_at.isoformat() if published_at else None, "related_tickers": sorted(set(re.findall(r"\b(?:SOXX|SMH|QQQ|NVDA|AMD|AVGO|MU|TSM|SPY|ES|NQ)\b", title.upper())))})
             if len(results) == 15:
                 return results
     return results
@@ -512,15 +543,25 @@ def fred_observation(series_id: str) -> dict[str, Any]:
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     try:
         data = pd.read_csv(url).replace(".", pd.NA).dropna()
-        return {"value": clean_number(data.iloc[-1, 1]), "as_of": f"{data.iloc[-1, 0]}T00:00:00+00:00"}
+        as_of = f"{data.iloc[-1, 0]}T00:00:00+00:00"
+        age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(as_of)).total_seconds() / 3600
+        return {"value": clean_number(data.iloc[-1, 1]), "as_of": as_of, "source": "FRED", "quality": "OK" if age_hours <= 30 else "STALE"}
     except (requests.RequestException, ValueError, IndexError):
-        return {"value": None, "as_of": None}
+        return {"value": None, "as_of": None, "source": "FRED", "quality": "MISSING"}
 
 
 def soxx_constituents() -> dict[str, Any]:
     url = os.getenv("SOXX_HOLDINGS_URL", SOXX_HOLDINGS_URL)
     try:
-        data = pd.read_csv(url, skiprows=9)
+        response = requests.get(url, headers={"User-Agent": "market-report/1.0", "Accept": "text/csv"}, timeout=30)
+        response.raise_for_status()
+        if response.content.lstrip().startswith(b"<"):
+            raise ValueError("iShares returned HTML instead of holdings CSV")
+        lines = response.text.splitlines()
+        header_line = next((position for position, line in enumerate(lines) if "Ticker" in line and "Weight" in line), None)
+        if header_line is None:
+            raise ValueError("iShares holdings CSV header not found")
+        data = pd.read_csv(io.StringIO("\n".join(lines[header_line:])))
         symbol_column = next((column for column in data.columns if str(column).lower() in {"ticker", "symbol"}), None)
         weight_column = next((column for column in data.columns if "weight" in str(column).lower()), None)
         if symbol_column is None or weight_column is None:
@@ -565,6 +606,7 @@ def build_report(output: Path) -> Path:
     chart_stats: list[dict[str, Any]] = []
     raw_data: dict[str, pd.DataFrame] = {}
     quality_table: list[dict[str, Any]] = []
+    canonical_closes = {symbol: canonical_rth_close(symbol) for symbol in CHARTS}
     for symbol, intervals in CHARTS.items():
         for interval in intervals:
             data = download(symbol, interval)
@@ -579,8 +621,15 @@ def build_report(output: Path) -> Path:
             latest = chart_data.iloc[-1]
             profile = volume_profile(chart_data)
             quality = data_quality(data, 400 if interval != "1d" else 250)
+            local_index = data.index.tz_convert(NY_TZ)
+            pm_volume = sum(float(row.Volume or 0) for row in data.itertuples() if session_name(row.Index) == "PREMARKET")
+            if interval != "1d" and pm_volume <= 0:
+                quality["status"] = "LOW QUALITY"
+                quality["volume_quality"] = "MISSING"
+            else:
+                quality["volume_quality"] = "OK"
             quality_table.append({"item": f"{symbol}/{interval}", **quality})
-            chart_stats.append({"symbol": symbol, "interval": interval, "visible_bars": len(chart_data), "latest_timestamp": chart_data.index[-1].isoformat(), "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": clean_number(latest["VWAP"]), "vwap_premarket": clean_number(latest.get("VWAP_PREMARKET")), "vwap_rth": clean_number(latest.get("VWAP_RTH")), "vwap_previous_rth": None, "poc": profile["poc"], "vah": profile["vah"], "val": profile["val"], "session_profiles": session_profiles(chart_data), "context": trading_context(data), "ohlcv_csv": csv_name, "quality": quality, "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
+            chart_stats.append({"symbol": symbol, "interval": interval, "visible_bars": len(chart_data), "latest_timestamp": chart_data.index[-1].isoformat(), "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": None if interval == "1d" else clean_number(latest["VWAP"]), "vwap_premarket": clean_number(latest.get("VWAP_PREMARKET")), "vwap_rth": clean_number(latest.get("VWAP_RTH")), "vwap_previous_rth": canonical_closes.get(symbol), "poc": profile["poc"], "vah": profile["vah"], "val": profile["val"], "session_profiles": session_profiles(data), "context": trading_context(data, canonical_closes.get(symbol)), "ohlcv_csv": csv_name, "quality": quality, "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
     market_quotes = {name: asdict(quote(symbol)) for name, symbol in MARKET.items()}
     quality_table.extend({"item": name, "status": item.get("quality", "MISSING"), "source": "Yahoo Finance/yfinance", "as_of": item.get("as_of")} for name, item in market_quotes.items())
     dgs2 = fred_observation("DGS2")
@@ -593,7 +642,7 @@ def build_report(output: Path) -> Path:
     options_data = [options(symbol) for symbol in ("SOXX", "QQQ", "NVDA", "SMH")]
     dgs10 = fred_observation("DGS10")
     real10 = fred_observation("DFII10")
-    quality_table.extend([{"item": "FRED/DGS2", "status": "OK" if dgs2["value"] is not None else "MISSING", "source": "FRED", "as_of": dgs2["as_of"]}, {"item": "FRED/DGS10", "status": "OK" if dgs10["value"] is not None else "MISSING", "source": "FRED", "as_of": dgs10["as_of"]}, {"item": "FRED/DFII10 real yield", "status": "OK" if real10["value"] is not None else "MISSING", "source": "FRED", "as_of": real10["as_of"]}, {"item": "SOXX holdings", "status": "OK" if holdings["available"] else "LOW QUALITY", "source": holdings["source"], "as_of": holdings["as_of"]}])
+    quality_table.extend([{"item": "FRED/DGS2", "status": dgs2.get("quality", "MISSING"), "source": "FRED", "as_of": dgs2["as_of"]}, {"item": "FRED/DGS10", "status": dgs10.get("quality", "MISSING"), "source": "FRED", "as_of": dgs10["as_of"]}, {"item": "FRED/DFII10 real yield", "status": real10.get("quality", "MISSING"), "source": "FRED", "as_of": real10["as_of"]}, {"item": "SOXX holdings", "status": "OK" if holdings["available"] else "LOW QUALITY", "source": holdings["source"], "as_of": holdings["as_of"]}])
     calendar = economic_calendar()
     fed = fed_probabilities()
     news_items = news()
@@ -646,7 +695,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
     lines += ["", "## 데이터 품질", "| 항목 | 상태 | 출처 | 기준 시각 |", "|---|---|---|---|"]
     lines += [f"| {item.get('item')} | {item.get('status')} | {item.get('source')} | {item.get('as_of')} |" for item in payload.get("quality", [])]
     lines += ["", "## 매크로 참고", f"- FRED 2년물: {format_value(payload['macro']['DGS2']['value'], '%')} (시각 {payload['macro']['DGS2']['as_of']})", f"- FRED 10년물: {format_value(payload['macro']['DGS10']['value'], '%')} (시각 {payload['macro']['DGS10']['as_of']})", f"- FRED 10년 실질금리: {format_value(payload['macro']['DFII10']['value'], '%')} (시각 {payload['macro']['DFII10']['as_of']})", "- 경제지표 실제값/예상값은 공개 캘린더, Fed 금리확률은 FedWatch 데이터 응답이 제공하는 범위만 표시합니다.", "", "## 주요 뉴스"]
-    lines += [f"- [{item['title']}]({item['link']}) · {item.get('source', 'N/A')} · {item.get('published_at', 'timestamp N/A')} · {item.get('summary', item['title'])} · {','.join(item.get('related_tickers', []))}" for item in payload["news"]]
+    lines += [f"- [{item['title']}]({item['link']}) · {item.get('source', 'N/A')} · {item.get('published_at', 'timestamp N/A')} · {item.get('summary', item['title'])} · 영향: {item.get('impact_path', 'N/A')} · 종목: {','.join(item.get('related_tickers', [])) or 'N/A'}" for item in payload["news"]]
     lines += ["", "## 첨부 차트", *[f"- `{item['file']}`" for item in payload["chart_files"]], "", "> 이 파일은 정보 제공용 자동 수집물이며 투자 조언이 아닙니다."]
     return "\n".join(lines) + "\n"
 
