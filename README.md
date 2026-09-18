@@ -43,7 +43,9 @@ Yahoo Finance는 1분봉을 최근 7일만 제공하므로 SOXX 1분 차트는 �
 
 현재 보고서에는 FRED 2년/10년 금리와 공개 경제 캘린더의 당일 미국 이벤트(실제값/예상값/이전값)를 포함합니다. FedWatch 데이터는 기본 CME 엔드포인트를 사용하며, 실행 환경에서 접근할 수 있는 JSON 엔드포인트가 따로 있으면 `FEDWATCH_URL` 환경변수로 지정할 수 있습니다. 응답이 없을 때는 보고서 생성을 중단하지 않고 `N/A`로 표시합니다.
 
-옵션 Gamma는 Yahoo Finance의 가장 가까운 만기 체인에서 내재변동성, 미결제약정, 현물가를 사용해 Black-Scholes Gamma를 추정하고, 계약 승수 100과 1% 가격변화를 반영한 Gamma Exposure를 계산합니다. Call Wall은 행사가별 call Gamma Exposure 최대값, Put Wall은 put Gamma Exposure 최소값입니다. Volume POC는 차트와 요약 모두 각 차트의 동일한 최근 400개 봉을 사용합니다.
+옵션 Gamma는 Yahoo Finance의 가장 가까운 만기 체인에서 내재변동성, 미결제약정, 현물가를 사용해 Black-Scholes Gamma를 추정하고, 계약 승수 100과 1% 가격변화를 반영한 Gamma Exposure를 계산합니다. Call Wall은 행사가별 call Gamma Exposure 최대값, Put Wall은 put Gamma Exposure 최소값이며, 리포트에 기준 만기일과 데이터 시각(UTC)을 함께 표시합니다. Volume POC는 각 차트에 실제로 표시하는 visible range를 사용하며, 차트와 요약이 동일한 주기별 봉 구간을 공유합니다.
+
+Fed 금리확률은 CME FedWatch를 먼저 시도하고, CME가 차단되면 ZQ 선물 기반 확률을 공개하는 FedWatch monitor 결과를 fallback으로 읽습니다. fallback 결과의 기준일과 출처도 리포트에 표시되며, 두 소스 모두 실패한 경우에만 `N/A`가 됩니다.
 
 경제 캘린더 공급자를 바꾸려면 `ECONOMIC_CALENDAR_URL`을 JSON URL로 지정하세요. KakaoTalk 자동 발송도 카카오 비즈메시지/채널 서버 인증이 필요하므로, 우선 생성된 `market-brief.md`를 파일로 전달하는 방식이 안정적입니다.
 

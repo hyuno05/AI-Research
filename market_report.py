@@ -31,6 +31,8 @@ CHARTS = {
     "NVDA": ["5m"],
     "QQQ": ["5m"],
 }
+VISIBLE_BARS = {"1m": 390, "5m": 240, "30m": 160, "1h": 120, "1d": 120}
+FEDWATCH_FALLBACK_URL = "https://amazingmazy.github.io/fedwatch-monitor/_static/amazingmazy--fedwatch_monitor/fedwatch_latest_forecast.html"
 MARKET = {
     "NQ 선물": "NQ=F",
     "VIX": "^VIX",
@@ -94,12 +96,11 @@ def volume_profile_poc(data: pd.DataFrame, bins: int = 30) -> float | None:
     return clean_number((poc_bin.left + poc_bin.right) / 2)
 
 
-def prepare_chart_data(data: pd.DataFrame) -> pd.DataFrame:
-    return add_indicators(data).tail(400)
+def prepare_chart_data(data: pd.DataFrame, interval: str) -> pd.DataFrame:
+    return add_indicators(data).tail(VISIBLE_BARS.get(interval, 400))
 
 
 def save_chart(symbol: str, interval: str, data: pd.DataFrame, output: Path) -> str:
-    data = prepare_chart_data(data)
     poc = volume_profile_poc(data)
     figure, (price_axis, volume_axis) = plt.subplots(2, 1, figsize=(13, 7), sharex=True, height_ratios=[3, 1])
     price_axis.plot(data.index, data["Close"], label="Close", color="#152238", linewidth=1.4)
@@ -160,7 +161,7 @@ def options(symbol: str) -> dict[str, Any]:
             rows["gammaExposure"] = None
         walls = gamma_walls(rows)
         top = rows.sort_values(["openInterest", "volume"], ascending=False).head(12)
-        return {"symbol": symbol, "expiry": expiry, "available": True, "spot": spot, "walls": walls, "rows": top.to_dict("records")}
+        return {"symbol": symbol, "expiry": expiry, "data_as_of": datetime.now(timezone.utc).isoformat(), "available": True, "spot": spot, "walls": walls, "rows": top.to_dict("records")}
     except Exception as error:  # Yahoo options can be unavailable outside market hours.
         return {"symbol": symbol, "available": False, "error": str(error)}
 
@@ -221,7 +222,33 @@ def fed_probabilities() -> dict[str, Any]:
             return {"available": True, "source": url, "meetings": meetings if isinstance(meetings, list) else []}
         except (requests.RequestException, ValueError, TypeError) as error:
             last_error = error
+    fallback_url = os.getenv("FEDWATCH_FALLBACK_URL", FEDWATCH_FALLBACK_URL)
+    try:
+        response = requests.get(fallback_url, timeout=20, headers={"User-Agent": "market-report/1.0"})
+        response.raise_for_status()
+        fallback = parse_fedwatch_html(response.text, fallback_url)
+        if fallback["meetings"]:
+            return fallback
+    except (requests.RequestException, ValueError, TypeError) as error:
+        last_error = error
     return {"available": False, "source": url, "meetings": [], "error": str(last_error)}
+
+
+def parse_fedwatch_html(document: str, source: str) -> dict[str, Any]:
+    text_match = re.search(r'"text":(\[[^\]]+\]),"textposition"', document)
+    label_match = re.search(r'"x":(\[[^\]]+\]),"y":', document)
+    as_of_match = re.search(r"202\d-\d{2}-\d{2}", document)
+    if not text_match or not label_match:
+        return {"available": False, "source": source, "meetings": []}
+    labels = json.loads(text_match.group(1))
+    probabilities = [float(value.rstrip("%")) for value in json.loads(text_match.group(1))]
+    labels = json.loads(label_match.group(1))
+    return {
+        "available": True,
+        "source": source,
+        "as_of": as_of_match.group(0) if as_of_match else None,
+        "meetings": [{"outcome": label.replace("<br>", " "), "probability_pct": probability} for label, probability in zip(labels, probabilities)],
+    }
 
 
 def news() -> list[dict[str, str]]:
@@ -252,10 +279,10 @@ def build_report(output: Path) -> Path:
             data = download(symbol, interval)
             if data.empty:
                 continue
-            chart_data = prepare_chart_data(data)
+            chart_data = prepare_chart_data(data, interval)
             chart_files.append({"symbol": symbol, "interval": interval, "file": save_chart(symbol, interval, chart_data, output)})
             latest = chart_data.iloc[-1]
-            chart_stats.append({"symbol": symbol, "interval": interval, "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": clean_number(latest["VWAP"]), "poc": volume_profile_poc(chart_data), "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
+            chart_stats.append({"symbol": symbol, "interval": interval, "visible_bars": len(chart_data), "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": clean_number(latest["VWAP"]), "poc": volume_profile_poc(chart_data), "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
     market_quotes = {name: asdict(quote(symbol)) for name, symbol in MARKET.items()}
     market_quotes["미국채 2년 금리"] = {"symbol": "DGS2", "price": fred_series("DGS2"), "change_pct": None, "as_of": None}
     semiconductor_quotes = {name: asdict(quote(symbol)) for name, symbol in SEMIS.items()}
@@ -281,7 +308,8 @@ def render_markdown(payload: dict[str, Any]) -> str:
     lines += ["", "## 옵션 주요 행사가", "| 종목 | 만기 | 구분 | 행사가 | 미결제약정 | 거래량 | Gamma | Gamma Exposure |", "|---|---|---|---:|---:|---:|---:|---:|"]
     for item in payload["options"]:
         walls = item.get("walls", {})
-        lines.append(f"- {item['symbol']} Gamma 합계: {format_value(walls.get('totalGammaExposure'))} · Call Wall: {format_value(walls.get('callWall'))} · Put Wall: {format_value(walls.get('putWall'))}")
+        lines.append(f"- {item['symbol']} 기준 만기: {item.get('expiry', 'N/A')} · 데이터 시각(UTC): {item.get('data_as_of', 'N/A')}")
+        lines.append(f"  Gamma 합계: {format_value(walls.get('totalGammaExposure'))} · Call Wall: {format_value(walls.get('callWall'))} · Put Wall: {format_value(walls.get('putWall'))}")
         for row in item.get("rows", []):
             lines.append(f"| {item['symbol']} | {item.get('expiry', 'N/A')} | {row.get('type', '')} | {row.get('strike', '')} | {row.get('openInterest', 0)} | {row.get('volume', 0)} | {format_value(row.get('gamma'))} | {format_value(row.get('gammaExposure'))} |")
     calendar = payload["economic_calendar"]
@@ -293,8 +321,12 @@ def render_markdown(payload: dict[str, Any]) -> str:
     fed = payload["fed_probabilities"]
     lines += ["", "## Fed 금리확률"]
     if fed.get("meetings"):
+        lines.append(f"- 데이터 시각: {fed.get('as_of', 'N/A')} · 출처: {fed.get('source', 'N/A')}")
         for meeting in fed["meetings"]:
-            lines.append(f"- {meeting}")
+            if "probability_pct" in meeting:
+                lines.append(f"- {meeting.get('outcome', 'N/A')}: {meeting['probability_pct']:.1f}%")
+            else:
+                lines.append(f"- {meeting}")
     else:
         lines.append("- N/A: FedWatch 데이터가 제공되지 않았습니다.")
     lines += ["", "## 매크로 참고", f"- FRED 2년물: {format_value(payload['macro']['DGS2'], '%')}", f"- FRED 10년물: {format_value(payload['macro']['DGS10'], '%')}", "- 경제지표 실제값/예상값은 공개 캘린더, Fed 금리확률은 FedWatch 데이터 응답이 제공하는 범위만 표시합니다.", "", "## 주요 뉴스"]
