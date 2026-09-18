@@ -15,7 +15,9 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import feedparser
 import matplotlib.pyplot as plt
@@ -92,8 +94,12 @@ def volume_profile_poc(data: pd.DataFrame, bins: int = 30) -> float | None:
     return clean_number((poc_bin.left + poc_bin.right) / 2)
 
 
+def prepare_chart_data(data: pd.DataFrame) -> pd.DataFrame:
+    return add_indicators(data).tail(400)
+
+
 def save_chart(symbol: str, interval: str, data: pd.DataFrame, output: Path) -> str:
-    data = add_indicators(data).tail(400)
+    data = prepare_chart_data(data)
     poc = volume_profile_poc(data)
     figure, (price_axis, volume_axis) = plt.subplots(2, 1, figsize=(13, 7), sharex=True, height_ratios=[3, 1])
     price_axis.plot(data.index, data["Close"], label="Close", color="#152238", linewidth=1.4)
@@ -132,14 +138,90 @@ def options(symbol: str) -> dict[str, Any]:
         expiries = ticker.options
         if not expiries:
             return {"symbol": symbol, "available": False}
-        chain = ticker.option_chain(expiries[0])
+        expiry = expiries[0]
+        chain = ticker.option_chain(expiry)
         rows = pd.concat([chain.calls.assign(type="call"), chain.puts.assign(type="put")])
+        spot = clean_number(getattr(ticker, "fast_info", {}).get("last_price"))
+        if spot is None:
+            history = ticker.history(period="5d", interval="1d", auto_adjust=False)
+            spot = clean_number(history["Close"].iloc[-1]) if not history.empty else None
         rows["openInterest"] = pd.to_numeric(rows["openInterest"], errors="coerce").fillna(0)
         rows["volume"] = pd.to_numeric(rows["volume"], errors="coerce").fillna(0)
+        rows["strike"] = pd.to_numeric(rows["strike"], errors="coerce")
+        rows["impliedVolatility"] = pd.to_numeric(rows["impliedVolatility"], errors="coerce")
+        expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+        days_to_expiry = max((expiry_date - datetime.now(timezone.utc).date()).days, 1)
+        if spot is not None:
+            rows["gamma"] = rows.apply(lambda row: option_gamma(spot, row["strike"], row["impliedVolatility"], days_to_expiry), axis=1)
+            rows["gammaExposure"] = rows["gamma"] * rows["openInterest"] * 100 * spot * spot * 0.01
+            rows.loc[rows["type"] == "put", "gammaExposure"] *= -1
+        else:
+            rows["gamma"] = None
+            rows["gammaExposure"] = None
+        walls = gamma_walls(rows)
         top = rows.sort_values(["openInterest", "volume"], ascending=False).head(12)
-        return {"symbol": symbol, "expiry": expiries[0], "available": True, "rows": top.to_dict("records")}
+        return {"symbol": symbol, "expiry": expiry, "available": True, "spot": spot, "walls": walls, "rows": top.to_dict("records")}
     except Exception as error:  # Yahoo options can be unavailable outside market hours.
         return {"symbol": symbol, "available": False, "error": str(error)}
+
+
+def option_gamma(spot: float | None, strike: float | None, implied_volatility: float | None, days_to_expiry: int) -> float | None:
+    if not spot or not strike or not implied_volatility or implied_volatility <= 0:
+        return None
+    time_to_expiry = max(days_to_expiry, 1) / 365
+    d1 = (math.log(spot / strike) + 0.5 * implied_volatility**2 * time_to_expiry) / (implied_volatility * math.sqrt(time_to_expiry))
+    return NormalDist().pdf(d1) / (spot * implied_volatility * math.sqrt(time_to_expiry))
+
+
+def gamma_walls(rows: pd.DataFrame) -> dict[str, Any]:
+    valid = rows.dropna(subset=["strike", "gammaExposure"])
+    if valid.empty:
+        return {"totalGammaExposure": None, "callWall": None, "putWall": None}
+    calls = valid[valid["type"] == "call"].groupby("strike")["gammaExposure"].sum()
+    puts = valid[valid["type"] == "put"].groupby("strike")["gammaExposure"].sum()
+    return {
+        "totalGammaExposure": clean_number(valid["gammaExposure"].sum()),
+        "callWall": clean_number(calls.idxmax()) if not calls.empty else None,
+        "putWall": clean_number(puts.idxmin()) if not puts.empty else None,
+    }
+
+
+def economic_calendar() -> dict[str, Any]:
+    url = os.getenv("ECONOMIC_CALENDAR_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
+    last_error: Exception | None = None
+    try:
+        for _ in range(2):
+            try:
+                response = requests.get(url, timeout=20)
+                response.raise_for_status()
+                events = response.json()
+                rows = []
+                for event in events if isinstance(events, list) else []:
+                    if event.get("country") not in {"USD", "US"} or str(event.get("date", ""))[:10] != today:
+                        continue
+                    rows.append({key: event.get(key, "") for key in ("title", "date", "impact", "actual", "forecast", "previous")})
+                return {"date": today, "available": True, "source": url, "events": rows}
+            except (requests.RequestException, ValueError, TypeError) as error:
+                last_error = error
+        return {"date": today, "available": False, "source": url, "events": [], "error": str(last_error)}
+    except Exception as error:
+        return {"date": today, "available": False, "source": url, "events": [], "error": str(error)}
+
+
+def fed_probabilities() -> dict[str, Any]:
+    url = os.getenv("FEDWATCH_URL", "https://www.cmegroup.com/services/fedwatch-tool-data.json")
+    last_error: Exception | None = None
+    for _ in range(2):
+        try:
+            response = requests.get(url, timeout=20, headers={"User-Agent": "market-report/1.0"})
+            response.raise_for_status()
+            data = response.json()
+            meetings = data.get("meetings", data.get("data", [])) if isinstance(data, dict) else data
+            return {"available": True, "source": url, "meetings": meetings if isinstance(meetings, list) else []}
+        except (requests.RequestException, ValueError, TypeError) as error:
+            last_error = error
+    return {"available": False, "source": url, "meetings": [], "error": str(last_error)}
 
 
 def news() -> list[dict[str, str]]:
@@ -170,14 +252,15 @@ def build_report(output: Path) -> Path:
             data = download(symbol, interval)
             if data.empty:
                 continue
-            chart_files.append({"symbol": symbol, "interval": interval, "file": save_chart(symbol, interval, data, output)})
-            latest = add_indicators(data).iloc[-1]
-            chart_stats.append({"symbol": symbol, "interval": interval, "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": clean_number(latest["VWAP"]), "poc": volume_profile_poc(data), "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
+            chart_data = prepare_chart_data(data)
+            chart_files.append({"symbol": symbol, "interval": interval, "file": save_chart(symbol, interval, chart_data, output)})
+            latest = chart_data.iloc[-1]
+            chart_stats.append({"symbol": symbol, "interval": interval, "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": clean_number(latest["VWAP"]), "poc": volume_profile_poc(chart_data), "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
     market_quotes = {name: asdict(quote(symbol)) for name, symbol in MARKET.items()}
     market_quotes["미국채 2년 금리"] = {"symbol": "DGS2", "price": fred_series("DGS2"), "change_pct": None, "as_of": None}
     semiconductor_quotes = {name: asdict(quote(symbol)) for name, symbol in SEMIS.items()}
     options_data = [options(symbol) for symbol in ("SOXX", "NVDA", "AMD", "AVGO", "MU", "TSM")]
-    payload = {"generated_at": generated_at.isoformat(), "charts": chart_stats, "chart_files": chart_files, "market": market_quotes, "semiconductors": semiconductor_quotes, "options": options_data, "news": news(), "macro": {"DGS2": fred_series("DGS2"), "DGS10": fred_series("DGS10")}, "data_notes": ["1분봉은 Yahoo Finance 제공 제한 때문에 최근 7일만 수집합니다.", "감마와 경제 캘린더/Fed 금리확률은 공급자 API가 설정된 경우에만 추가할 수 있습니다."]}
+    payload = {"generated_at": generated_at.isoformat(), "charts": chart_stats, "chart_files": chart_files, "market": market_quotes, "semiconductors": semiconductor_quotes, "options": options_data, "economic_calendar": economic_calendar(), "fed_probabilities": fed_probabilities(), "news": news(), "macro": {"DGS2": fred_series("DGS2"), "DGS10": fred_series("DGS10")}, "data_notes": ["1분봉은 Yahoo Finance 제공 제한 때문에 최근 7일만 수집합니다.", "옵션 감마는 Yahoo의 내재변동성/미결제약정으로 계산한 추정치이며, 경제 캘린더와 Fed 금리확률은 외부 데이터 제공자 응답에 따라 N/A가 될 수 있습니다."]}
     (output / "report.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     pd.DataFrame(chart_stats).to_csv(output / "indicators.csv", index=False)
     report_path = output / "market-brief.md"
@@ -195,11 +278,26 @@ def render_markdown(payload: dict[str, Any]) -> str:
     lines += ["", "## 지표 요약", "| 종목 | 주기 | 종가 | RSI(14) | EMA20 | EMA50 | EMA200 | VWAP | Volume POC |", "|---|---|---:|---:|---:|---:|---:|---:|---:|"]
     for item in payload["charts"]:
         lines.append("| {symbol} | {interval} | {close:.2f} | {rsi14:.2f} | {ema20:.2f} | {ema50:.2f} | {ema200:.2f} | {vwap:.2f} | {poc:.2f} |".format(**{key: (value if value is not None else float("nan")) for key, value in item.items()}))
-    lines += ["", "## 옵션 주요 행사가", "| 종목 | 만기 | 구분 | 행사가 | 미결제약정 | 거래량 |", "|---|---|---|---:|---:|---:|"]
+    lines += ["", "## 옵션 주요 행사가", "| 종목 | 만기 | 구분 | 행사가 | 미결제약정 | 거래량 | Gamma | Gamma Exposure |", "|---|---|---|---:|---:|---:|---:|---:|"]
     for item in payload["options"]:
+        walls = item.get("walls", {})
+        lines.append(f"- {item['symbol']} Gamma 합계: {format_value(walls.get('totalGammaExposure'))} · Call Wall: {format_value(walls.get('callWall'))} · Put Wall: {format_value(walls.get('putWall'))}")
         for row in item.get("rows", []):
-            lines.append(f"| {item['symbol']} | {item.get('expiry', 'N/A')} | {row.get('type', '')} | {row.get('strike', '')} | {row.get('openInterest', 0)} | {row.get('volume', 0)} |")
-    lines += ["", "## 매크로 참고", f"- FRED 2년물: {format_value(payload['macro']['DGS2'], '%')}", f"- FRED 10년물: {format_value(payload['macro']['DGS10'], '%')}", "- 경제지표 결과, Fed 발언/금리확률, 옵션 감마는 별도 API 연결 시 보강됩니다.", "", "## 주요 뉴스"]
+            lines.append(f"| {item['symbol']} | {item.get('expiry', 'N/A')} | {row.get('type', '')} | {row.get('strike', '')} | {row.get('openInterest', 0)} | {row.get('volume', 0)} | {format_value(row.get('gamma'))} | {format_value(row.get('gammaExposure'))} |")
+    calendar = payload["economic_calendar"]
+    lines += ["", "## 당일 경제지표", "| 시각 | 지표 | 중요도 | 실제 | 예상 | 이전 |", "|---|---|---|---:|---:|---:|"]
+    for event in calendar.get("events", []):
+        lines.append(f"| {event.get('date', '')} | {event.get('title', '')} | {event.get('impact', '')} | {event.get('actual', '') or 'N/A'} | {event.get('forecast', '') or 'N/A'} | {event.get('previous', '') or 'N/A'} |")
+    if not calendar.get("events"):
+        lines.append("| - | 당일 미국 경제지표 없음 또는 데이터 미수신 | - | N/A | N/A | N/A |")
+    fed = payload["fed_probabilities"]
+    lines += ["", "## Fed 금리확률"]
+    if fed.get("meetings"):
+        for meeting in fed["meetings"]:
+            lines.append(f"- {meeting}")
+    else:
+        lines.append("- N/A: FedWatch 데이터가 제공되지 않았습니다.")
+    lines += ["", "## 매크로 참고", f"- FRED 2년물: {format_value(payload['macro']['DGS2'], '%')}", f"- FRED 10년물: {format_value(payload['macro']['DGS10'], '%')}", "- 경제지표 실제값/예상값은 공개 캘린더, Fed 금리확률은 FedWatch 데이터 응답이 제공하는 범위만 표시합니다.", "", "## 주요 뉴스"]
     lines += [f"- [{item['title']}]({item['link']})" for item in payload["news"]]
     lines += ["", "## 첨부 차트", *[f"- `{item['file']}`" for item in payload["chart_files"]], "", "> 이 파일은 정보 제공용 자동 수집물이며 투자 조언이 아닙니다."]
     return "\n".join(lines) + "\n"
