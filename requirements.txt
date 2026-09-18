@@ -1,0 +1,5 @@
+yfinance>=0.2.66
+pandas>=2.2.0
+matplotlib>=3.8.0
+requests>=2.31.0
+feedparser>=6.0.11
