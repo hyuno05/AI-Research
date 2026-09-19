@@ -7,6 +7,8 @@ on:
     - cron: "0 0 * * 1-5"
     # One-time test: 2026-09-19 02:45 UTC = 2026-09-19 11:45 KST.
     - cron: "45 2 19 9 *"
+    # One-time test: 2026-09-19 03:00 UTC = 2026-09-19 12:00 KST.
+    - cron: "0 3 19 9 *"
     - cron: "0 7 * * 1-5"
     # Temporary one-time test: 2026-09-18 23:00 UTC = 2026-09-19 08:00 KST.
     - cron: "0 23 18 9 *"
