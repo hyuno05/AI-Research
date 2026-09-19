@@ -32,6 +32,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Run validation tests
+        run: python -m unittest -v test_market_report.py
+
       - name: Generate report
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}

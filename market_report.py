@@ -40,6 +40,8 @@ VISIBLE_BARS = {"1m": 390, "5m": 240, "30m": 160, "1h": 120, "1d": 120}
 NY_TZ = ZoneInfo("America/New_York")
 PREMARKET_START = "04:00"
 PREMARKET_END = "09:30"
+RTH_START = "09:30"
+RTH_END = "16:00"
 FEDWATCH_FALLBACK_URL = "https://amazingmazy.github.io/fedwatch-monitor/_static/amazingmazy--fedwatch_monitor/fedwatch_latest_forecast.html"
 MARKET = {
     "NQ 선물": "NQ=F",
@@ -126,17 +128,98 @@ def clean_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
     returns = data["Close"].pct_change().abs()
     median_return = returns.rolling(50, min_periods=10).median()
     outlier = returns > (median_return * 12).clip(lower=0.08)
+    if not outlier.empty:
+        outlier.iloc[-1] = False
     data.loc[~valid | outlier, ["Open", "High", "Low", "Close", "Volume"]] = pd.NA
     return data.dropna(subset=["Open", "High", "Low", "Close"])
 
 
-def data_quality(data: pd.DataFrame, required_bars: int) -> dict[str, Any]:
+def market_session(now: datetime | None = None) -> str:
+    instant = now or datetime.now(timezone.utc)
+    if instant.astimezone(timezone.utc).weekday() >= 5:
+        return "CLOSED"
+    local = instant.astimezone(NY_TZ)
+    if not is_market_day(local.date()):
+        return "CLOSED"
+    clock = local.strftime("%H:%M")
+    if clock < PREMARKET_START:
+        return "CLOSED"
+    if clock < PREMARKET_END:
+        return "PREMARKET"
+    if clock < RTH_END:
+        return "RTH"
+    return "AFTER_HOURS"
+
+
+def previous_market_day(day: date) -> date:
+    candidate = day - timedelta(days=1)
+    while not is_market_day(candidate):
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def is_market_day(day: date) -> bool:
+    if day.weekday() >= 5:
+        return False
+    fixed = {(1, 1), (6, 19), (7, 4), (12, 25)}
+    if (day.month, day.day) in fixed:
+        return False
+    if day.month == 1 and day.weekday() == 0 and 15 <= day.day <= 21:
+        return False
+    if day.month == 2 and day.weekday() == 0 and 15 <= day.day <= 21:
+        return False
+    if day.month == 5 and day.weekday() == 0 and day.day >= 25:
+        return False
+    if day.month == 9 and day.weekday() == 0 and day.day <= 7:
+        return False
+    if day.month == 11 and day.weekday() == 3 and 22 <= day.day <= 28:
+        return False
+    if day.month == 12 and day.weekday() == 0 and day.day >= 25:
+        return False
+    # Anonymous Gregorian Easter calculation, used only for Good Friday.
+    year = day.year
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f, g = (b + 8) // 25, (b - (b + 8) // 25 + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    month = (a + 11 * h + 22 * l) // 451
+    easter = date(year, (h + l - 7 * month + 114) // 31, (h + l - 7 * month + 114) % 31 + 1)
+    return day != easter - timedelta(days=2)
+
+
+def latest_completed_trading_day(now: datetime | None = None) -> date:
+    local = (now or datetime.now(timezone.utc)).astimezone(NY_TZ)
+    if local.weekday() < 5 and local.strftime("%H:%M") >= RTH_END:
+        return local.date()
+    return previous_market_day(local.date())
+
+
+def localize_index(data: pd.DataFrame) -> pd.DatetimeIndex:
+    return data.index.tz_convert(NY_TZ) if getattr(data.index, "tz", None) else data.index.tz_localize(NY_TZ)
+
+
+def data_trading_day(data: pd.DataFrame) -> date:
+    latest = data.index[-1]
+    if latest.tzinfo is not None and latest.hour == 0 and latest.minute == 0:
+        return latest.date()
+    return localize_index(data)[-1].date()
+
+
+def data_quality(data: pd.DataFrame, required_bars: int, expected_day: date | None = None) -> dict[str, Any]:
     if data.empty:
         return {"status": "MISSING", "source": "Yahoo Finance/yfinance", "as_of": None, "bars": 0}
     as_of = data.index[-1].isoformat()
     age_minutes = (datetime.now(timezone.utc) - data.index[-1].to_pydatetime().astimezone(timezone.utc)).total_seconds() / 60
-    status = "OK" if len(data) >= required_bars and age_minutes <= 30 else "STALE" if age_minutes > 30 else "LOW QUALITY"
-    return {"status": status, "source": data.attrs.get("source", "Yahoo Finance/yfinance"), "as_of": as_of, "bars": len(data), "required_bars": required_bars, "age_minutes": round(age_minutes, 1)}
+    latest_day = data_trading_day(data)
+    date_mismatch = expected_day is not None and latest_day < expected_day
+    live_stale = market_session() not in {"CLOSED", "AFTER_HOURS"} and age_minutes > 30
+    status = "STALE" if date_mismatch or live_stale else "OK" if len(data) >= required_bars else "LOW QUALITY"
+    result = {"status": status, "source": data.attrs.get("source", "Yahoo Finance/yfinance"), "as_of": as_of, "bars": len(data), "required_bars": required_bars, "age_minutes": round(age_minutes, 1), "latest_trading_day": latest_day.isoformat()}
+    if date_mismatch:
+        result["reason"] = "DATE_MISMATCH"
+    return result
 
 
 def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
@@ -177,10 +260,10 @@ def volume_profile(data: pd.DataFrame, bins: int = 30) -> dict[str, float | None
     valid = pd.DataFrame({"price": prices, "volume": volumes}).dropna()
     valid = valid[valid["volume"] > 0]
     if valid.empty:
-        return {"poc": None, "vah": None, "val": None}
+        return {"poc": None, "vah": None, "val": None, "status": "MISSING"}
     if valid.empty or valid["price"].nunique() < 2:
         price = clean_number(valid["price"].iloc[-1]) if not valid.empty else None
-        return {"poc": price, "vah": price, "val": price}
+        return {"poc": price, "vah": price, "val": price, "status": "OK"}
     price_bins = pd.cut(valid["price"], bins=bins)
     profile = valid.groupby(price_bins, observed=True)["volume"].sum()
     poc_bin = profile.idxmax()
@@ -197,23 +280,33 @@ def volume_profile(data: pd.DataFrame, bins: int = 30) -> dict[str, float | None
         position = max(candidates, key=lambda candidate: profile.iloc[candidate])
         selected.add(position)
         accumulated += float(profile.iloc[position])
-    return {"poc": poc, "vah": clean_number(max(centers.index[position] for position in selected)), "val": clean_number(min(centers.index[position] for position in selected))}
+    vah = clean_number(max(centers.index[position] for position in selected))
+    val = clean_number(min(centers.index[position] for position in selected))
+    low = clean_number(valid["price"].min())
+    high = clean_number(valid["price"].max())
+    valid_range = low is not None and high is not None and low <= val <= poc <= vah <= high
+    return {"poc": poc, "vah": vah, "val": val, "session_low": low, "session_high": high, "status": "OK" if valid_range else "PROFILE_INVALID"}
 
 
 def volume_profile_poc(data: pd.DataFrame, bins: int = 30) -> float | None:
     return volume_profile(data, bins)["poc"]
 
 
-def session_profiles(data: pd.DataFrame) -> dict[str, Any]:
-    index = data.index.tz_convert(NY_TZ) if getattr(data.index, "tz", None) else data.index.tz_localize(NY_TZ)
+def session_profiles(data: pd.DataFrame, trading_date: date | None = None) -> dict[str, Any]:
+    index = localize_index(data)
     sessions = pd.Series(index.date, index=data.index)
     names = pd.Series(index.map(session_name), index=data.index)
-    pm = data.loc[names == "PREMARKET"]
-    rth = data.loc[names == "RTH"]
+    target = trading_date or latest_completed_trading_day()
+    pm = data.loc[(sessions == target) & (names == "PREMARKET")]
+    rth = data.loc[(sessions == target) & (names == "RTH")]
     days = sorted(set(sessions[names == "RTH"]))
     five = data.loc[sessions.isin(days[-5:]) & (names == "RTH")]
     twenty = data.loc[sessions.isin(days[-20:]) & (names == "RTH")]
-    return {"PM": volume_profile(pm), "RTH": volume_profile(rth), "5RTH": volume_profile(five), "20RTH": volume_profile(twenty), "volume_bars": {"PM": int((pm["Volume"] > 0).sum()), "RTH": int((rth["Volume"] > 0).sum()), "5RTH": int((five["Volume"] > 0).sum()), "20RTH": int((twenty["Volume"] > 0).sum())}}
+    profiles = {"PM": volume_profile(pm), "RTH": volume_profile(rth), "5RTH": volume_profile(five), "20RTH": volume_profile(twenty)}
+    for profile in profiles.values():
+        if profile.get("status") == "PROFILE_INVALID":
+            profile["value"] = None
+    return {**profiles, "trading_date": target.isoformat(), "volume_bars": {"PM": int((pm["Volume"] > 0).sum()), "RTH": int((rth["Volume"] > 0).sum()), "5RTH": int((five["Volume"] > 0).sum()), "20RTH": int((twenty["Volume"] > 0).sum())}}
 
 
 def prepare_chart_data(data: pd.DataFrame, interval: str) -> pd.DataFrame:
@@ -284,53 +377,74 @@ def ohlc_summary(data: pd.DataFrame) -> dict[str, Any]:
     return {"open": clean_number(data["Open"].iloc[0]), "high": clean_number(data["High"].max()), "low": clean_number(data["Low"].min()), "close": clean_number(data["Close"].iloc[-1]), "volume": clean_number(data["Volume"].sum()), "as_of": data.index[-1].isoformat()}
 
 
-def trading_context(data: pd.DataFrame, canonical_previous_close: float | None = None) -> dict[str, Any]:
+def opening_ranges(data: pd.DataFrame, trading_date: date) -> tuple[dict[str, Any], dict[str, Any]]:
+    local = data.copy()
+    local.index = localize_index(data)
+    day = local[local.index.date == trading_date]
+    def range_for(end_time: str) -> dict[str, Any]:
+        sliced = day[(day.index.strftime("%H:%M:%S") >= "09:30:00") & (day.index.strftime("%H:%M:%S") < end_time)]
+        result = ohlc_summary(sliced)
+        result["trading_date"] = trading_date.isoformat()
+        result["status"] = "MISSING" if sliced.empty else "OK"
+        if not sliced.empty and result["as_of"] > f"{trading_date.isoformat()}T{end_time}-04:00":
+            result["status"] = "INVALID"
+        return result
+    return range_for("09:35:00"), range_for("09:45:00")
+
+
+def trading_context(data: pd.DataFrame, canonical_previous_close: float | dict[str, Any] | None = None, trading_date: date | None = None, opening_data: pd.DataFrame | None = None) -> dict[str, Any]:
     if data.empty:
         return {}
     local_index = data.index.tz_convert(NY_TZ) if getattr(data.index, "tz", None) else data.index.tz_localize(NY_TZ)
     local = data.copy()
     local.index = local_index
-    today = local.index[-1].date()
+    today = trading_date or latest_completed_trading_day()
     regular = local.between_time("09:30", "16:00")
     days = sorted(set(regular.index.date))
     if not days:
         empty = ohlc_summary(pd.DataFrame())
         return {"previous_day": empty, "previous_week": empty, "premarket": ohlc_summary(local[(local.index.date == today) & (local.index.strftime("%H:%M") >= PREMARKET_START) & (local.index.strftime("%H:%M") < PREMARKET_END)]), "overnight": empty, "gap_pct": None, "or5": empty, "or15": empty, "atr14": atr14(data), "rvol": None}
-    previous_day = days[-2] if len(days) > 1 and days[-1] == today else days[-1]
+    previous_day = previous_market_day(today)
     previous = regular[regular.index.date == previous_day]
     today_regular = regular[regular.index.date == today]
     prem = local[(local.index.date == today) & (local.index.strftime("%H:%M") >= PREMARKET_START) & (local.index.strftime("%H:%M") < PREMARKET_END)]
     current_open = clean_number(today_regular["Open"].iloc[0]) if not today_regular.empty else (clean_number(prem["Open"].iloc[0]) if not prem.empty else None)
-    prior_close = canonical_previous_close if canonical_previous_close is not None else (clean_number(previous["Close"].iloc[-1]) if not previous.empty else None)
+    canonical = canonical_previous_close if isinstance(canonical_previous_close, dict) else {"date": previous_day, "close": canonical_previous_close}
+    prior_close = canonical.get("close") if canonical.get("date") in {previous_day, previous_day.isoformat()} else None
     previous_days = sorted(set(regular.index.date))
     regular_days = pd.Series(regular.index.date, index=regular.index)
     previous_week = regular.loc[regular_days.isin(previous_days[-6:-1])]
     overnight = local[(local.index.date == today) & (local.index.strftime("%H:%M") >= "16:00")]
     today_rth = regular[regular.index.date == today]
-    opening = today_rth.iloc[:15] if not today_rth.empty else pd.DataFrame()
-    opening5 = today_rth.iloc[:5] if not today_rth.empty else pd.DataFrame()
+    opening5, opening = opening_ranges(opening_data if opening_data is not None else data, today)
     prior_daily = [regular[regular.index.date == day]["Volume"].sum() for day in previous_days[-21:-1]]
     today_volume = today_rth["Volume"].sum() if not today_rth.empty else prem["Volume"].sum()
     current_premarket_price = clean_number(prem["Close"].iloc[-1]) if not prem.empty else None
     gap_value = current_premarket_price if current_premarket_price is not None else current_open
-    current_session = "Premarket" if current_premarket_price is not None and today_regular.empty else "Current RTH" if not today_regular.empty else "After-hours"
+    current_session = market_session()
     gap_basis = "latest premarket price" if current_premarket_price is not None else "premarket open" if not prem.empty and current_open is not None else "current RTH open" if not today_regular.empty else "N/A"
-    return {"previous_day": ohlc_summary(previous), "previous_week": ohlc_summary(previous_week), "premarket": ohlc_summary(prem), "overnight": ohlc_summary(overnight), "previous_rth": {"close": prior_close, "as_of": previous.index[-1].isoformat() if not previous.empty else None, "source": "canonical daily RTH close"}, "current_rth": ohlc_summary(today_regular), "after_hours": ohlc_summary(overnight), "current_session": current_session, "gap_pct": (gap_value / prior_close - 1) * 100 if gap_value is not None and prior_close else None, "gap_basis": gap_basis, "or5": ohlc_summary(opening5), "or15": ohlc_summary(opening), "atr14": atr14(data), "rvol": clean_number(today_volume / (sum(prior_daily) / len(prior_daily))) if prior_daily and sum(prior_daily) else None}
+    reference_timestamp = prem.index[-1].isoformat() if not prem.empty else today_regular.index[0].isoformat() if not today_regular.empty else None
+    gap_valid = gap_value is not None and prior_close is not None and canonical.get("date") in {previous_day, previous_day.isoformat()}
+    return {"market_session": current_session, "latest_completed_session": today.isoformat(), "previous_day": ohlc_summary(previous), "previous_week": ohlc_summary(previous_week), "premarket": ohlc_summary(prem), "overnight": ohlc_summary(overnight), "previous_rth": {"date": canonical.get("date"), "close": prior_close, "as_of": previous.index[-1].isoformat() if not previous.empty else None, "source": "canonical daily RTH close", "status": "OK" if prior_close is not None else "INVALID_PREVIOUS_CLOSE"}, "current_rth": ohlc_summary(today_regular), "after_hours": ohlc_summary(overnight), "current_session": current_session, "reference_session_date": today.isoformat() if gap_value is not None else None, "reference_price": gap_value, "reference_price_timestamp": reference_timestamp, "previous_rth_date": canonical.get("date"), "previous_rth_close": prior_close, "gap_pct": (gap_value / prior_close - 1) * 100 if gap_valid else None, "gap_status": "OK" if gap_valid else "N/A", "gap_basis": gap_basis if gap_valid else "N/A", "or5": opening5, "or15": opening, "atr14": atr14(data), "rvol": clean_number(today_volume / (sum(prior_daily) / len(prior_daily))) if prior_daily and sum(prior_daily) else None}
 
 
-def canonical_rth_close(symbol: str) -> float | None:
+def canonical_rth_close(symbol: str) -> dict[str, Any]:
     try:
         data = yf.download(symbol, period="10d", interval="1d", auto_adjust=False, progress=False)
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         if data.empty:
-            return None
-        local_dates = pd.DatetimeIndex(data.index).tz_localize(NY_TZ) if data.index.tz is None else data.index.tz_convert(NY_TZ)
+            return {"symbol": symbol, "date": None, "close": None, "status": "MISSING", "source": "Yahoo Finance/yfinance daily RTH"}
+        local_dates = pd.DatetimeIndex(data.index).date
         today = datetime.now(NY_TZ).date()
-        eligible = data.loc[[value < today for value in local_dates.date]]
-        return clean_number(eligible["Close"].iloc[-1]) if not eligible.empty else clean_number(data["Close"].iloc[-1])
+        target = previous_market_day(latest_completed_trading_day())
+        eligible = data.loc[[value <= target for value in local_dates]]
+        if eligible.empty:
+            return {"symbol": symbol, "date": None, "close": None, "status": "MISSING", "source": "Yahoo Finance/yfinance daily RTH"}
+        row_date = local_dates[list(data.index).index(eligible.index[-1])]
+        return {"symbol": symbol, "date": row_date.isoformat(), "close": clean_number(eligible["Close"].iloc[-1]), "status": "OK", "source": "Yahoo Finance/yfinance daily RTH"}
     except Exception:
-        return None
+        return {"symbol": symbol, "date": None, "close": None, "status": "MISSING", "source": "Yahoo Finance/yfinance daily RTH"}
 
 
 def options(symbol: str) -> dict[str, Any]:
@@ -655,6 +769,34 @@ def format_value(value: float | None, suffix: str = "") -> str:
     return f"{value:,.2f}{suffix}" if value is not None else "N/A"
 
 
+CORE_CHARTS = ("SOXX/1m", "SOXX/5m", "SOXX/30m", "SOXX/1h", "SOXX/1d", "NVDA/5m", "QQQ/5m", "SMH/5m")
+
+
+def validate_report(payload: dict[str, Any]) -> dict[str, Any]:
+    expected = payload["latest_completed_trading_day"]
+    chart_map = {f"{item['symbol']}/{item['interval']}": item for item in payload.get("charts", [])}
+    dates = {}
+    for key in CORE_CHARTS:
+        item = chart_map.get(key)
+        if item is None:
+            dates[key] = {"status": "MISSING", "latest": None}
+            continue
+        latest = item.get("latest_trading_day")
+        status = "PASS" if latest == expected else "DATE_MISMATCH"
+        dates[key] = {"status": status, "latest": latest}
+    date_status = "PASS" if all(item["status"] == "PASS" for item in dates.values()) else "DATA_MISMATCH"
+    canonical = payload.get("canonical_previous_rth", {})
+    canonical_status = "PASS" if canonical.get("status") == "OK" and canonical.get("date") == payload.get("previous_rth_date") else "INVALID_PREVIOUS_CLOSE"
+    gaps = [item.get("context", {}) for item in chart_map.values() if "gap_status" in item.get("context", {})]
+    gap_status = "PASS" if all(context.get("gap_status") in {"OK", "N/A"} for context in gaps) else "INVALID"
+    or_status = "PASS" if all(context.get("or5", {}).get("status") != "INVALID" and context.get("or15", {}).get("status") != "INVALID" for context in gaps) else "INVALID"
+    profiles = [item.get("session_profiles", {}) for item in chart_map.values()]
+    profile_status = "PASS" if not any(profile.get(session, {}).get("status") == "PROFILE_INVALID" for profile in profiles for session in ("PM", "RTH", "5RTH", "20RTH")) else "PROFILE_INVALID"
+    as_of_status = "PASS" if payload.get("breadth", {}).get("as_of") and payload.get("macro", {}).get("DGS10", {}).get("as_of") and any(item.get("data_as_of") for item in payload.get("options", [])) else "MISSING"
+    statuses = {"date_sync": date_status, "market_session": "PASS" if payload.get("market_session") else "MISSING", "canonical_previous_rth": canonical_status, "gap": gap_status, "opening_range": or_status, "volume_profile": profile_status, "breadth_options_macro_as_of": as_of_status}
+    return {"status": "PASS" if all(value == "PASS" for value in statuses.values()) else "FAIL", "expected_latest_completed_trading_day": expected, "core_dates": dates, "checks": statuses}
+
+
 def build_report(output: Path) -> Path:
     output.mkdir(parents=True, exist_ok=True)
     generated_at = datetime.now(timezone.utc)
@@ -662,7 +804,9 @@ def build_report(output: Path) -> Path:
     chart_stats: list[dict[str, Any]] = []
     raw_data: dict[str, pd.DataFrame] = {}
     quality_table: list[dict[str, Any]] = []
+    analysis_day = latest_completed_trading_day()
     canonical_closes = {symbol: canonical_rth_close(symbol) for symbol in CHARTS}
+    opening_sources = {symbol: download(symbol, "1m") for symbol in {"SOXX", "NVDA", "QQQ", "SMH"}}
     for symbol, intervals in CHARTS.items():
         for interval in intervals:
             data = download(symbol, interval)
@@ -675,8 +819,7 @@ def build_report(output: Path) -> Path:
             chart_data[["Open", "High", "Low", "Close", "Volume"]].to_csv(output / csv_name, index_label="timestamp")
             chart_files.append({"symbol": symbol, "interval": interval, "file": save_chart(symbol, interval, chart_data, output)})
             latest = chart_data.iloc[-1]
-            profile = volume_profile(chart_data)
-            quality = data_quality(data, 400 if interval != "1d" else 250)
+            quality = data_quality(data, 400 if interval != "1d" else 250, analysis_day)
             local_index = data.index.tz_convert(NY_TZ)
             pm_volume = sum(float(row.Volume or 0) for row in data.itertuples() if session_name(row.Index) == "PREMARKET")
             if interval != "1d" and pm_volume <= 0:
@@ -685,15 +828,18 @@ def build_report(output: Path) -> Path:
             else:
                 quality["volume_quality"] = "OK"
             quality_table.append({"item": f"{symbol}/{interval}", **quality})
-            chart_stats.append({"symbol": symbol, "interval": interval, "visible_bars": len(chart_data), "latest_timestamp": chart_data.index[-1].isoformat(), "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": None if interval == "1d" else clean_number(latest["VWAP"]), "vwap_premarket": clean_number(latest.get("VWAP_PREMARKET")), "vwap_rth": clean_number(latest.get("VWAP_RTH")), "vwap_previous_rth": canonical_closes.get(symbol), "poc": profile["poc"], "vah": profile["vah"], "val": profile["val"], "session_profiles": session_profiles(data), "context": trading_context(data, canonical_closes.get(symbol)), "ohlcv_csv": csv_name, "quality": quality, "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
+            profiles = session_profiles(data, analysis_day)
+            profile = profiles["RTH"]
+            canonical = canonical_closes.get(symbol, {})
+            chart_stats.append({"symbol": symbol, "interval": interval, "visible_bars": len(chart_data), "latest_timestamp": chart_data.index[-1].isoformat(), "latest_trading_day": data_trading_day(data).isoformat(), "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": None if interval == "1d" else clean_number(latest["VWAP"]), "vwap_premarket": clean_number(latest.get("VWAP_PREMARKET")), "vwap_rth": clean_number(latest.get("VWAP_RTH")), "vwap_previous_rth": canonical.get("close"), "poc": profile["poc"], "vah": profile["vah"], "val": profile["val"], "session_profiles": profiles, "context": trading_context(data, canonical, analysis_day, opening_sources.get(symbol)), "ohlcv_csv": csv_name, "quality": quality, "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
     market_quotes = {name: asdict(quote(symbol)) for name, symbol in MARKET.items()}
     quality_table.extend({"item": name, "status": item.get("quality", "MISSING"), "source": item.get("source", "Yahoo Finance/yfinance"), "as_of": item.get("as_of")} for name, item in market_quotes.items())
     dgs2 = fred_observation("DGS2")
     market_quotes["미국채 2년 금리"] = {"symbol": "DGS2", "price": dgs2["value"], "change_pct": None, "as_of": dgs2["as_of"]}
-    semiconductor_quotes = {name: asdict(quote(symbol, canonical_closes.get(symbol))) for name, symbol in SEMIS.items()}
+    semiconductor_quotes = {name: asdict(quote(symbol, canonical_closes.get(symbol, {}).get("close"))) for name, symbol in SEMIS.items()}
     holdings = soxx_constituents()
     holding_symbols = {row["symbol"] for row in holdings.get("rows", [])}
-    holding_quotes = {symbol: asdict(quote(symbol, canonical_rth_close(symbol))) for symbol in holding_symbols if symbol not in semiconductor_quotes}
+    holding_quotes = {symbol: asdict(quote(symbol, canonical_rth_close(symbol).get("close"))) for symbol in holding_symbols if symbol not in semiconductor_quotes}
     breadth = breadth_and_relative_strength(holdings, {**semiconductor_quotes, **holding_quotes})
     options_data = [options(symbol) for symbol in ("SOXX", "QQQ", "NVDA", "SMH")]
     dgs10 = fred_observation("DGS10")
@@ -703,7 +849,9 @@ def build_report(output: Path) -> Path:
     fed = fed_probabilities()
     news_items = news()
     quality_table.extend([{"item": "options", "status": "OK" if any(item.get("quality") == "OK" for item in options_data) else "LOW QUALITY", "source": "Yahoo Finance/yfinance", "as_of": datetime.now(timezone.utc).isoformat()}, {"item": "FedWatch", "status": fed.get("quality", "MISSING") if fed.get("meetings") else "MISSING", "source": fed.get("source"), "as_of": fed.get("as_of")}, {"item": "economic calendar", "status": "OK" if calendar.get("available") else "MISSING", "source": calendar.get("source"), "as_of": calendar.get("date")}, {"item": "news", "status": "OK" if news_items else "LOW QUALITY", "source": "filtered Google News RSS", "as_of": generated_at.isoformat()}])
-    payload = {"generated_at": generated_at.isoformat(), "charts": chart_stats, "chart_files": chart_files, "market": market_quotes, "semiconductors": semiconductor_quotes, "options": options_data, "economic_calendar": calendar, "fed_probabilities": fed, "news": news_items, "semiconductor_events": semiconductor_events(), "macro": {"DGS2": dgs2, "DGS10": dgs10, "DFII10": real10}, "breadth": breadth, "relative_strength": relative_strength({symbol: raw_data[key] for symbol, key in (("SOXX", "SOXX/5m"), ("QQQ", "QQQ/5m"), ("SMH", "SMH/5m")) if key in raw_data}), "soxx_holdings": holdings, "quality": quality_table, "data_notes": ["1분봉은 Yahoo Finance 제공 제한 때문에 최근 7일만 수집합니다.", "EMA200은 intraday 400 bars, 일봉 250 거래일 이상 warm-up 후 계산합니다.", "옵션 감마는 유효한 bid/ask·IV·미결제약정과 현물가 ±20% 범위에서 계산한 추정치입니다."]}
+    canonical_previous = canonical_closes.get("SOXX", {})
+    payload = {"generated_at": generated_at.isoformat(), "market_session": market_session(), "latest_completed_trading_day": analysis_day.isoformat(), "previous_rth_date": canonical_previous.get("date"), "canonical_previous_rth": canonical_previous, "charts": chart_stats, "chart_files": chart_files, "market": market_quotes, "semiconductors": semiconductor_quotes, "options": options_data, "economic_calendar": calendar, "fed_probabilities": fed, "news": news_items, "semiconductor_events": semiconductor_events(), "macro": {"DGS2": dgs2, "DGS10": dgs10, "DFII10": real10}, "breadth": breadth, "relative_strength": relative_strength({symbol: raw_data[key] for symbol, key in (("SOXX", "SOXX/5m"), ("QQQ", "QQQ/5m"), ("SMH", "SMH/5m")) if key in raw_data}), "soxx_holdings": holdings, "quality": quality_table, "data_notes": ["1분봉은 Yahoo Finance 제공 제한 때문에 최근 7일만 수집합니다.", "EMA200은 intraday 400 bars, 일봉 250 거래일 이상 warm-up 후 계산합니다.", "옵션 감마는 유효한 bid/ask·IV·미결제약정과 현물가 ±20% 범위에서 계산한 추정치입니다."]}
+    payload["validation"] = validate_report(payload)
     (output / "report.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     pd.DataFrame(chart_stats).to_csv(output / "indicators.csv", index=False)
     report_path = output / "market-brief.md"
@@ -712,7 +860,7 @@ def build_report(output: Path) -> Path:
 
 
 def render_markdown(payload: dict[str, Any]) -> str:
-    lines = [f"# 미국장 반도체·매크로 브리핑", f"생성 시각(UTC): {payload['generated_at']}", "", "## 시장", "| 항목 | 값 | 등락률 |", "|---|---:|---:|"]
+    lines = [f"# 미국장 반도체·매크로 브리핑", f"생성 시각(UTC): {payload['generated_at']}", f"시장 상태: {payload.get('market_session', 'N/A')} · 최신 완료 거래일: {payload.get('latest_completed_trading_day', 'N/A')}", "", "## 시장", "| 항목 | 값 | 등락률 |", "|---|---:|---:|"]
     for name, item in payload["market"].items():
         lines.append(f"| {name} | {format_value(item['price'])} | {format_value(item['change_pct'], '%')} |")
     lines += ["", "## 반도체 프리마켓/최근 거래일", "| 종목 | 값 | 등락률 |", "|---|---:|---:|"]
@@ -748,6 +896,8 @@ def render_markdown(payload: dict[str, Any]) -> str:
         lines.append("- N/A: FedWatch 데이터가 제공되지 않았습니다.")
     lines += ["", "## Breadth / Relative Strength", f"- SOXX breadth: 상승 {payload['breadth'].get('up_count', 'N/A')} / 하락 {payload['breadth'].get('down_count', 'N/A')} / 보합 {payload['breadth'].get('unchanged_count', 'N/A')} (coverage {format_value(payload['breadth'].get('coverage_pct'), '%')})", f"- SOXX weighted breadth: {format_value(payload['breadth'].get('weighted_breadth'), '%')} · 상태 {payload['breadth'].get('quality', 'MISSING')}", f"- Relative strength: {payload.get('relative_strength', {})}", "", "## 향후 7일 반도체 이벤트"]
     lines += [f"- {item['symbol']} {item['event']} · {item['as_of']}" for item in payload.get("semiconductor_events", [])] or ["- N/A"]
+    lines += ["", "## Global Validation", f"전체 상태: **{payload.get('validation', {}).get('status', 'N/A')}**", "| 검증 항목 | 결과 |", "|---|---|"]
+    lines += [f"| {name} | {status} |" for name, status in payload.get("validation", {}).get("checks", {}).items()]
     lines += ["", "## 데이터 품질", "| 항목 | 상태 | 출처 | 기준 시각 |", "|---|---|---|---|"]
     lines += [f"| {item.get('item')} | {item.get('status')} | {item.get('source')} | {item.get('as_of')} |" for item in payload.get("quality", [])]
     lines += ["", "## 매크로 참고", f"- FRED 2년물: {format_value(payload['macro']['DGS2']['value'], '%')} (시각 {payload['macro']['DGS2']['as_of']})", f"- FRED 10년물: {format_value(payload['macro']['DGS10']['value'], '%')} (시각 {payload['macro']['DGS10']['as_of']})", f"- FRED 10년 실질금리: {format_value(payload['macro']['DFII10']['value'], '%')} (시각 {payload['macro']['DFII10']['as_of']})", "- 경제지표 실제값/예상값은 공개 캘린더, Fed 금리확률은 FedWatch 데이터 응답이 제공하는 범위만 표시합니다.", "", "## 주요 뉴스"]
