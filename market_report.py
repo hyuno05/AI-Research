@@ -49,8 +49,8 @@ MARKET = {
     "미국채 10년 금리": "^TNX",
     "DXY": "DX-Y.NYB",
 }
-SEMIS = {"NVDA": "NVDA", "AMD": "AMD", "AVGO": "AVGO", "MU": "MU", "TSM": "TSM", "SMH": "SMH"}
-SOXX_HOLDINGS_URL = "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf/1467271812596.ajax?fileType=csv&fileName=SOXX_holdings&dataType=fund"
+SEMIS = {"SOXX": "SOXX", "NVDA": "NVDA", "QQQ": "QQQ", "AMD": "AMD", "AVGO": "AVGO", "MU": "MU", "TSM": "TSM", "SMH": "SMH"}
+SOXX_HOLDINGS_URL = "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf/latest-holdings.csv"
 
 
 @dataclass
@@ -62,6 +62,7 @@ class Quote:
     bid: float | None = None
     ask: float | None = None
     spread: float | None = None
+    spread_pct: float | None = None
     quality: str = "MISSING"
 
 
@@ -74,6 +75,10 @@ def clean_number(value: Any) -> float | None:
 
 
 def download(symbol: str, interval: str) -> pd.DataFrame:
+    polygon_data = download_polygon(symbol, interval)
+    if polygon_data is not None and not polygon_data.empty:
+        polygon_data.attrs["source"] = "Polygon.io aggregates"
+        return polygon_data
     period = "7d" if interval == "1m" else "60d" if interval in {"5m", "15m", "30m", "1h"} else "3y"
     data = yf.download(symbol, period=period, interval=interval, auto_adjust=False, prepost=True, progress=False)
     if data.empty:
@@ -83,7 +88,31 @@ def download(symbol: str, interval: str) -> pd.DataFrame:
     data = data.dropna(subset=["Open", "High", "Low", "Close"])
     if data.index.tz is None:
         data.index = data.index.tz_localize(timezone.utc)
+    data.attrs["source"] = "Yahoo Finance/yfinance (fallback; extended-hours volume may be incomplete)"
     return clean_ohlcv(data)
+
+
+def download_polygon(symbol: str, interval: str) -> pd.DataFrame | None:
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key or interval == "1d":
+        return None
+    multiplier, timespan = {"1m": (1, "minute"), "5m": (5, "minute"), "30m": (30, "minute"), "1h": (1, "hour")}.get(interval, (None, None))
+    if multiplier is None:
+        return None
+    end = datetime.now(NY_TZ).date()
+    start = end - timedelta(days=8 if interval == "1m" else 70)
+    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{start}/{end}"
+    try:
+        response = requests.get(url, params={"adjusted": "false", "sort": "asc", "limit": 50000, "apiKey": api_key}, timeout=30)
+        response.raise_for_status()
+        rows = response.json().get("results", [])
+        if not rows:
+            return None
+        data = pd.DataFrame(rows).rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+        data.index = pd.to_datetime(data["t"], unit="ms", utc=True)
+        return clean_ohlcv(data[["Open", "High", "Low", "Close", "Volume"]])
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return None
 
 
 def clean_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
@@ -107,7 +136,7 @@ def data_quality(data: pd.DataFrame, required_bars: int) -> dict[str, Any]:
     as_of = data.index[-1].isoformat()
     age_minutes = (datetime.now(timezone.utc) - data.index[-1].to_pydatetime().astimezone(timezone.utc)).total_seconds() / 60
     status = "OK" if len(data) >= required_bars and age_minutes <= 30 else "STALE" if age_minutes > 30 else "LOW QUALITY"
-    return {"status": status, "source": "Yahoo Finance/yfinance", "as_of": as_of, "bars": len(data), "required_bars": required_bars, "age_minutes": round(age_minutes, 1)}
+    return {"status": status, "source": data.attrs.get("source", "Yahoo Finance/yfinance"), "as_of": as_of, "bars": len(data), "required_bars": required_bars, "age_minutes": round(age_minutes, 1)}
 
 
 def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
@@ -223,21 +252,22 @@ def save_chart(symbol: str, interval: str, data: pd.DataFrame, output: Path) -> 
     return filename
 
 
-def quote(symbol: str) -> Quote:
+def quote(symbol: str, canonical_previous_close: float | None = None) -> Quote:
     ticker = yf.Ticker(symbol)
     history = ticker.history(period="5d", interval="1m", auto_adjust=False, prepost=True)
     if history.empty:
         return Quote(symbol, None, None, None)
     current = clean_number(history["Close"].iloc[-1])
-    previous = clean_number(history["Close"].iloc[-2]) if len(history) > 1 else None
+    previous = canonical_previous_close if canonical_previous_close is not None else clean_number(history["Close"].iloc[-2]) if len(history) > 1 else None
     change = (current / previous - 1) * 100 if current is not None and previous else None
     info = getattr(ticker, "fast_info", {})
     bid = clean_number(info.get("bid"))
     ask = clean_number(info.get("ask"))
     spread = ask - bid if bid is not None and ask is not None and ask >= bid else None
+    spread_pct = spread / ((ask + bid) / 2) * 100 if spread is not None and bid and ask else None
     age_minutes = (datetime.now(timezone.utc) - history.index[-1].to_pydatetime().astimezone(timezone.utc)).total_seconds() / 60
     quality = "OK" if age_minutes <= 30 else "STALE"
-    return Quote(symbol, current, change, history.index[-1].isoformat(), bid, ask, spread, quality)
+    return Quote(symbol, current, change, history.index[-1].isoformat(), bid, ask, spread, spread_pct, quality)
 
 
 def atr14(data: pd.DataFrame) -> float | None:
@@ -281,7 +311,11 @@ def trading_context(data: pd.DataFrame, canonical_previous_close: float | None =
     opening5 = today_rth.iloc[:5] if not today_rth.empty else pd.DataFrame()
     prior_daily = [regular[regular.index.date == day]["Volume"].sum() for day in previous_days[-21:-1]]
     today_volume = today_rth["Volume"].sum() if not today_rth.empty else prem["Volume"].sum()
-    return {"previous_day": ohlc_summary(previous), "previous_week": ohlc_summary(previous_week), "premarket": ohlc_summary(prem), "overnight": ohlc_summary(overnight), "gap_pct": (current_open / prior_close - 1) * 100 if current_open is not None and prior_close else None, "or5": ohlc_summary(opening5), "or15": ohlc_summary(opening), "atr14": atr14(data), "rvol": clean_number(today_volume / (sum(prior_daily) / len(prior_daily))) if prior_daily and sum(prior_daily) else None}
+    current_premarket_price = clean_number(prem["Close"].iloc[-1]) if not prem.empty else None
+    gap_value = current_premarket_price if current_premarket_price is not None else current_open
+    current_session = "Premarket" if current_premarket_price is not None and today_regular.empty else "Current RTH" if not today_regular.empty else "After-hours"
+    gap_basis = "latest premarket price" if current_premarket_price is not None else "premarket open" if not prem.empty and current_open is not None else "current RTH open" if not today_regular.empty else "N/A"
+    return {"previous_day": ohlc_summary(previous), "previous_week": ohlc_summary(previous_week), "premarket": ohlc_summary(prem), "overnight": ohlc_summary(overnight), "previous_rth": {"close": prior_close, "as_of": previous.index[-1].isoformat() if not previous.empty else None, "source": "canonical daily RTH close"}, "current_rth": ohlc_summary(today_regular), "after_hours": ohlc_summary(overnight), "current_session": current_session, "gap_pct": (gap_value / prior_close - 1) * 100 if gap_value is not None and prior_close else None, "gap_basis": gap_basis, "or5": ohlc_summary(opening5), "or15": ohlc_summary(opening), "atr14": atr14(data), "rvol": clean_number(today_volume / (sum(prior_daily) / len(prior_daily))) if prior_daily and sum(prior_daily) else None}
 
 
 def canonical_rth_close(symbol: str) -> float | None:
@@ -331,7 +365,8 @@ def options(symbol: str) -> dict[str, Any]:
             rows = pd.concat([chain.calls.assign(type="call"), chain.puts.assign(type="put")])
             rows = valid_option_rows(rows, spot)
             coverage = int(rows["strike"].nunique()) if not rows.empty else 0
-            category_quality = "OK" if coverage >= 8 and set(rows["type"]) == {"call", "put"} else "LOW QUALITY"
+            side_coverage = rows.groupby("type")["strike"].nunique().to_dict() if not rows.empty else {}
+            category_quality = "OK" if coverage >= 8 and side_coverage.get("call", 0) >= 4 and side_coverage.get("put", 0) >= 4 else "LOW QUALITY"
             if rows.empty:
                 result_categories[category] = {"expiry": expiry, "data_as_of": captured_at, "quality": "LOW QUALITY", "strike_coverage": 0, "rows": [], "walls": gamma_walls(rows)}
                 continue
@@ -352,7 +387,7 @@ def valid_option_rows(rows: pd.DataFrame, spot: float | None) -> pd.DataFrame:
     for column in columns:
         rows[column] = pd.to_numeric(rows.get(column), errors="coerce")
     rows = rows.dropna(subset=["strike", "bid", "ask", "impliedVolatility", "openInterest"])
-    rows = rows[(rows["bid"] > 0) & (rows["ask"] >= rows["bid"]) & (rows["impliedVolatility"] > 0) & (rows["openInterest"] > 0)]
+    rows = rows[(rows["bid"] > 0) & (rows["ask"] > rows["bid"]) & (rows["impliedVolatility"].between(0.01, 5.0)) & (rows["openInterest"] >= 5) & (rows["volume"].fillna(0) >= 1)]
     if "lastTradeDate" in rows:
         traded_at = pd.to_datetime(rows["lastTradeDate"], utc=True, errors="coerce")
         age_hours = (pd.Timestamp.now(tz="UTC") - traded_at).dt.total_seconds() / 3600
@@ -428,7 +463,8 @@ def fed_probabilities() -> dict[str, Any]:
             response.raise_for_status()
             data = response.json()
             meetings = data.get("meetings", data.get("data", [])) if isinstance(data, dict) else data
-            return {"available": True, "quality": "LOW CONFIDENCE", "cross_validation": "PENDING FED FUNDS FUTURES CHECK", "source": url, "as_of": datetime.now(timezone.utc).isoformat(), "next_fomc": next_fomc_date(), "meetings": meetings if isinstance(meetings, list) else []}
+            futures = quote("ZQ=F")
+            return {"available": True, "quality": "LOW CONFIDENCE" if futures.price is None else "LOW CONFIDENCE", "cross_validation": {"source": "CME Fed Funds Futures proxy (ZQ=F)", "price": futures.price, "implied_rate_pct": 100 - futures.price if futures.price is not None else None, "as_of": futures.as_of, "status": "AVAILABLE" if futures.price is not None else "MISSING"}, "source": url, "as_of": datetime.now(timezone.utc).isoformat(), "next_fomc": next_fomc_date(), "meetings": meetings if isinstance(meetings, list) else []}
         except (requests.RequestException, ValueError, TypeError) as error:
             last_error = error
     fallback_url = os.getenv("FEDWATCH_FALLBACK_URL", FEDWATCH_FALLBACK_URL)
@@ -455,7 +491,11 @@ def parse_fedwatch_html(document: str, source: str) -> dict[str, Any]:
         return {"available": False, "source": source, "meetings": []}
     import base64
     import struct
-    probabilities = list(struct.unpack(f"{len(base64.b64decode(y_match.group(1))) // 8}d", base64.b64decode(y_match.group(1))))
+    encoded_values = json.loads(f'"{y_match.group(1)}"')
+    decoded_values = base64.b64decode(encoded_values)
+    item_size = 8 if len(decoded_values) % 8 == 0 else 4
+    value_format = "d" if item_size == 8 else "f"
+    probabilities = list(struct.unpack(f"{len(decoded_values) // item_size}{value_format}", decoded_values[: len(decoded_values) // item_size * item_size]))
     labels = json.loads(label_match.group(1))
     return {
         "available": True,
@@ -502,7 +542,12 @@ def news() -> list[dict[str, str]]:
                 continue
             seen.add(key)
             raw_summary = re.sub(r"<[^>]+>", " ", item.get("summary", ""))
-            summary = re.sub(r"\s+", " ", html.unescape(raw_summary)).strip()[:500] or title
+            factual = re.sub(r"\s+", " ", html.unescape(raw_summary)).strip()[:420]
+            summary = f"{factual}." if factual and not factual.endswith(".") else factual
+            if summary:
+                summary += " 관련 수급·정책·실적 경로를 통해 반도체 및 지수 변동성에 영향을 줄 수 있습니다."
+            else:
+                summary = "원문 요약이 제공되지 않아 제목 외 사실관계는 확인하지 못했습니다. 관련 종목의 가격·거래량 반응을 함께 확인해야 합니다."
             paths = []
             for term, path in (("fed", "금리·할인율"), ("rate", "금리·할인율"), ("yield", "채권금리"), ("inflation", "인플레이션·정책"), ("tariff", "관세·공급망"), ("chip", "반도체 공급망"), ("semiconductor", "반도체 공급망"), ("earnings", "실적·가이던스"), ("ai", "AI 수요")):
                 if term in title.lower() and path not in paths:
@@ -518,13 +563,19 @@ def semiconductor_events() -> list[dict[str, Any]]:
     events = []
     cutoff = datetime.now(timezone.utc)
     horizon = cutoff + timedelta(days=7)
-    for symbol in ("NVDA", "AMD", "AVGO", "MU", "TSM"):
+    symbols = ("NVDA", "AMD", "AVGO", "MU", "TSM")
+    try:
+        holdings = soxx_constituents().get("rows", [])
+        symbols += tuple(row["symbol"] for row in holdings[:30] if row["symbol"] not in symbols)
+    except Exception:
+        pass
+    for symbol in symbols:
         try:
             dates = yf.Ticker(symbol).get_earnings_dates(limit=8)
             for timestamp in dates.index:
                 stamp = timestamp.to_pydatetime()
                 if cutoff <= stamp.astimezone(timezone.utc) <= horizon:
-                    events.append({"symbol": symbol, "event": "earnings", "as_of": stamp.isoformat(), "source": "Yahoo Finance/yfinance"})
+                    events.append({"symbol": symbol, "event": "earnings", "event_type": "earnings", "as_of": stamp.isoformat(), "source": "Yahoo Finance/yfinance"})
         except Exception:
             continue
     return events
@@ -578,9 +629,14 @@ def soxx_constituents() -> dict[str, Any]:
 
 def breadth_and_relative_strength(holdings: dict[str, Any], quotes: dict[str, Any]) -> dict[str, Any]:
     rows = holdings.get("rows", [])
-    weighted_up = sum(row["weight"] for row in rows if quotes.get(row["symbol"], {}).get("change_pct", 0) > 0)
-    contribution = sorted(({"symbol": row["symbol"], "weight": row["weight"], "change_pct": quotes.get(row["symbol"], {}).get("change_pct"), "contribution_pct": row["weight"] * (quotes.get(row["symbol"], {}).get("change_pct") or 0)} for row in rows if row["symbol"] in quotes), key=lambda row: abs(row["contribution_pct"] or 0), reverse=True)[:10]
-    return {"weighted_breadth": weighted_up if rows else None, "top_constituent_contribution": contribution}
+    covered = [row for row in rows if clean_number(quotes.get(row["symbol"], {}).get("change_pct")) is not None]
+    up = sum(1 for row in covered if quotes[row["symbol"]]["change_pct"] > 0)
+    down = sum(1 for row in covered if quotes[row["symbol"]]["change_pct"] < 0)
+    unchanged = len(covered) - up - down
+    weighted_up = sum(row["weight"] for row in covered if quotes[row["symbol"]]["change_pct"] > 0)
+    weighted_down = sum(row["weight"] for row in covered if quotes[row["symbol"]]["change_pct"] < 0)
+    contribution = sorted(({"symbol": row["symbol"], "weight": row["weight"], "change_pct": quotes[row["symbol"]]["change_pct"], "contribution_pct": row["weight"] * quotes[row["symbol"]]["change_pct"]} for row in covered), key=lambda row: abs(row["contribution_pct"]), reverse=True)[:10]
+    return {"up_count": up, "down_count": down, "unchanged_count": unchanged, "covered_count": len(covered), "total_count": len(rows), "coverage_pct": round(len(covered) / len(rows) * 100, 2) if rows else None, "weighted_up_pct": round(weighted_up * 100, 4) if rows else None, "weighted_down_pct": round(weighted_down * 100, 4) if rows else None, "weighted_breadth": round((weighted_up - weighted_down) * 100, 4) if rows else None, "top_constituent_contribution": contribution, "quality": "OK" if covered and len(covered) / len(rows) >= 0.8 else "LOW QUALITY", "as_of": max((quotes[row["symbol"]].get("as_of") for row in covered), default=None), "source": "iShares holdings + quote provider"}
 
 
 def relative_strength(data: dict[str, pd.DataFrame]) -> dict[str, Any]:
@@ -631,18 +687,18 @@ def build_report(output: Path) -> Path:
             quality_table.append({"item": f"{symbol}/{interval}", **quality})
             chart_stats.append({"symbol": symbol, "interval": interval, "visible_bars": len(chart_data), "latest_timestamp": chart_data.index[-1].isoformat(), "close": clean_number(latest["Close"]), "rsi14": clean_number(latest["RSI14"]), "vwap": None if interval == "1d" else clean_number(latest["VWAP"]), "vwap_premarket": clean_number(latest.get("VWAP_PREMARKET")), "vwap_rth": clean_number(latest.get("VWAP_RTH")), "vwap_previous_rth": canonical_closes.get(symbol), "poc": profile["poc"], "vah": profile["vah"], "val": profile["val"], "session_profiles": session_profiles(data), "context": trading_context(data, canonical_closes.get(symbol)), "ohlcv_csv": csv_name, "quality": quality, "ema20": clean_number(latest["EMA20"]), "ema50": clean_number(latest["EMA50"]), "ema200": clean_number(latest["EMA200"])})
     market_quotes = {name: asdict(quote(symbol)) for name, symbol in MARKET.items()}
-    quality_table.extend({"item": name, "status": item.get("quality", "MISSING"), "source": "Yahoo Finance/yfinance", "as_of": item.get("as_of")} for name, item in market_quotes.items())
+    quality_table.extend({"item": name, "status": item.get("quality", "MISSING"), "source": item.get("source", "Yahoo Finance/yfinance"), "as_of": item.get("as_of")} for name, item in market_quotes.items())
     dgs2 = fred_observation("DGS2")
     market_quotes["미국채 2년 금리"] = {"symbol": "DGS2", "price": dgs2["value"], "change_pct": None, "as_of": dgs2["as_of"]}
-    semiconductor_quotes = {name: asdict(quote(symbol)) for name, symbol in SEMIS.items()}
+    semiconductor_quotes = {name: asdict(quote(symbol, canonical_closes.get(symbol))) for name, symbol in SEMIS.items()}
     holdings = soxx_constituents()
     holding_symbols = {row["symbol"] for row in holdings.get("rows", [])}
-    holding_quotes = {symbol: asdict(quote(symbol)) for symbol in holding_symbols if symbol not in semiconductor_quotes}
+    holding_quotes = {symbol: asdict(quote(symbol, canonical_rth_close(symbol))) for symbol in holding_symbols if symbol not in semiconductor_quotes}
     breadth = breadth_and_relative_strength(holdings, {**semiconductor_quotes, **holding_quotes})
     options_data = [options(symbol) for symbol in ("SOXX", "QQQ", "NVDA", "SMH")]
     dgs10 = fred_observation("DGS10")
     real10 = fred_observation("DFII10")
-    quality_table.extend([{"item": "FRED/DGS2", "status": dgs2.get("quality", "MISSING"), "source": "FRED", "as_of": dgs2["as_of"]}, {"item": "FRED/DGS10", "status": dgs10.get("quality", "MISSING"), "source": "FRED", "as_of": dgs10["as_of"]}, {"item": "FRED/DFII10 real yield", "status": real10.get("quality", "MISSING"), "source": "FRED", "as_of": real10["as_of"]}, {"item": "SOXX holdings", "status": "OK" if holdings["available"] else "LOW QUALITY", "source": holdings["source"], "as_of": holdings["as_of"]}])
+    quality_table.extend([{"item": "FRED/DGS2", "status": dgs2.get("quality", "MISSING"), "source": "FRED", "as_of": dgs2["as_of"]}, {"item": "FRED/DGS10", "status": dgs10.get("quality", "MISSING"), "source": "FRED", "as_of": dgs10["as_of"]}, {"item": "FRED/DFII10 real yield", "status": real10.get("quality", "MISSING"), "source": "FRED", "as_of": real10["as_of"]}, {"item": "SOXX holdings", "status": "OK" if holdings["available"] else "LOW QUALITY", "source": holdings["source"], "as_of": holdings["as_of"]}, {"item": "SOXX breadth", "status": breadth.get("quality", "MISSING"), "source": breadth.get("source"), "as_of": breadth.get("as_of")}])
     calendar = economic_calendar()
     fed = fed_probabilities()
     news_items = news()
@@ -690,7 +746,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
                 lines.append(f"- {meeting}")
     else:
         lines.append("- N/A: FedWatch 데이터가 제공되지 않았습니다.")
-    lines += ["", "## Breadth / Relative Strength", f"- SOXX weighted breadth: {format_value(payload['breadth'].get('weighted_breadth'), '%')}", f"- Relative strength: {payload.get('relative_strength', {})}", "", "## 향후 7일 반도체 이벤트"]
+    lines += ["", "## Breadth / Relative Strength", f"- SOXX breadth: 상승 {payload['breadth'].get('up_count', 'N/A')} / 하락 {payload['breadth'].get('down_count', 'N/A')} / 보합 {payload['breadth'].get('unchanged_count', 'N/A')} (coverage {format_value(payload['breadth'].get('coverage_pct'), '%')})", f"- SOXX weighted breadth: {format_value(payload['breadth'].get('weighted_breadth'), '%')} · 상태 {payload['breadth'].get('quality', 'MISSING')}", f"- Relative strength: {payload.get('relative_strength', {})}", "", "## 향후 7일 반도체 이벤트"]
     lines += [f"- {item['symbol']} {item['event']} · {item['as_of']}" for item in payload.get("semiconductor_events", [])] or ["- N/A"]
     lines += ["", "## 데이터 품질", "| 항목 | 상태 | 출처 | 기준 시각 |", "|---|---|---|---|"]
     lines += [f"| {item.get('item')} | {item.get('status')} | {item.get('source')} | {item.get('as_of')} |" for item in payload.get("quality", [])]

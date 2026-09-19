@@ -41,7 +41,7 @@ python market_report.py --output reports/manual
 
 ## 데이터 범위와 한계
 
-Yahoo Finance는 1분봉을 최근 7일만 제공하므로 SOXX 1분 차트는 그 범위만 생성됩니다. 일봉은 3년, intraday는 60일을 받아 EMA200 warm-up을 확보한 뒤 표시 구간을 잘라냅니다. 모든 intraday 수집은 extended hours를 포함하고 최신 캔들의 timestamp를 기록합니다. 다만 Yahoo가 extended-hours 실제 volume을 0으로 반환하면 PM VWAP/Profile/RVOL을 계산하지 않고 `LOW QUALITY`로 표시합니다. 차트는 OHLC 캔들로 표시하며 Premarket/RTH/overnight VWAP은 세션마다 reset됩니다.
+Polygon.io API 키를 `POLYGON_API_KEY`로 지정하면 intraday/extended-hours OHLCV를 Polygon aggregates에서 우선 수집해 실제 premarket volume으로 PM VWAP/Profile/RVOL을 계산합니다. 키가 없거나 Polygon 응답이 비어 있으면 Yahoo Finance를 fallback으로 사용하며, extended-hours volume이 0이면 해당 항목을 `LOW QUALITY`로 표시합니다. Yahoo Finance는 1분봉을 최근 7일만 제공하므로 SOXX 1분 차트는 그 범위만 생성됩니다. 일봉은 3년, intraday는 60일을 받아 EMA200 warm-up을 확보한 뒤 표시 구간을 잘라냅니다. 차트는 OHLC 캔들로 표시하며 Premarket/RTH/overnight VWAP은 세션마다 reset됩니다.
 
 시세·차트·옵션·FRED·뉴스 데이터에는 가능한 경우 원천 데이터의 최신 timestamp를 붙입니다. 뉴스는 최근 48시간 내 제목에서 금리, Fed/FOMC, 수익, 반도체/AI, 관세, 지수·시장 등 영향 키워드가 확인되는 항목만 표시합니다.
 
