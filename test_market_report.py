@@ -9,6 +9,7 @@ from market_report import (
     latest_completed_trading_day,
     market_session,
     opening_ranges,
+    session_vwap,
     session_profiles,
     validate_report,
 )
@@ -57,6 +58,14 @@ class MarketReportValidationTests(unittest.TestCase):
         data = pd.DataFrame({"Open": [100, 101], "High": [101, 102], "Low": [99, 100], "Close": [100, 101], "Volume": [1, 1]}, index=index)
         profiles = session_profiles(data, date(2026, 9, 18))
         self.assertIn(profiles["PM"]["status"], {"OK", "MISSING"})
+
+    def test_session_vwap_stays_inside_session_range(self):
+        index = pd.date_range("2026-09-18 04:00", periods=3, freq="min", tz=NY)
+        data = pd.DataFrame({"Open": [100, 101, 102], "High": [101, 102, 103], "Low": [99, 100, 101], "Close": [100, 101, 102], "Volume": [10, 20, 30]}, index=index)
+        result = session_vwap(data, date(2026, 9, 18), "PREMARKET")
+        self.assertEqual(result["status"], "OK")
+        self.assertGreaterEqual(result["value"], result["session_low"])
+        self.assertLessEqual(result["value"], result["session_high"])
 
 
 if __name__ == "__main__":
