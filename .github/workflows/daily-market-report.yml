@@ -31,6 +31,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Generate report
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: bash run_daily.sh
 
       - name: Upload report files
